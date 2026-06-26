@@ -39,8 +39,7 @@ runs:
     - name: Gemini Review
       id: review
       shell: bash
-      if: ${{ steps.diff.outputs.skip != 'true' }}
-      env:
+      if:     env:
         DIFF_DATA: ${{ steps.diff.outputs.patch }}
         TECH_STACK: ${{ inputs.tech_stack }}
       run: |
@@ -92,7 +91,7 @@ runs:
         - Start directly with the **Analysis Tiers** (e.g., `🔴 Critical...`, `🟡 Performance...`, `🔵 Maintainability...`) or the Risk Score if no issues are found.
         - Use valid Markdown with real newlines, NOT literal '\n' characters.
         - If a Tier has no issues, omit that header entirely.
-        - At the end, include a **Risk Score**: `✅ Safe to Merge`, `⚠️ Proceed with Caution`, or `🚨 Blocked`.
+        - **CRITICAL COMPLIANCE:** You MUST always end the review with a **Risk Score** header line showing either: `✅ Safe to Merge`, `⚠️ Proceed with Caution`, or `🚨 Blocked`. Do not drop this section.
 
         **Final Rule:** If absolutely nothing is found, reply exactly with:
         > LGTM! No structural, security, or performance issues identified.
@@ -112,18 +111,28 @@ runs:
         json=$(jq -n --arg c "$combined" '{contents:[{parts:[{text:$c}]}], generationConfig:{temperature:0.1}}')
 
         # -----------------------------------------------------------------
-        # 5. Call Gemini API
+        # 5. Call Gemini API with automatic 503 retry and recovery loops
         # -----------------------------------------------------------------
-        resp=$(curl -fsS \
+        echo "Contacting Gemini API endpoints..."
+        if ! resp=$(curl -fsS \
+          --retry 3 \
+          --retry-delay 2 \
+          --retry-connrefused \
           "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent" \
           -H "x-goog-api-key: ${{ inputs.gemini_api_key }}" \
           -H "Content-Type: application/json" \
-          -d "$json")
+          -d "$json"); then
+          
+          echo "⚠️ Gemini API is temporarily unavailable (503). Running alternative response bridge."
+          echo "The Gemini API service is temporarily down or overloaded. Automated code checks skipped for this run update." > review.md
+          exit 0
+        fi
 
         # -----------------------------------------------------------------
-        # 6. Extract the raw AI response
+        # 6. FIXED: Use printf to pipe raw string values safely without 
+        #    letting the shell echo collapse formatting down into literal "\n".
         # -----------------------------------------------------------------
-        echo "$resp" | jq -r '.candidates[0].content.parts[0].text // "LGTM! No structural, security, or performance issues identified."' > review.md
+        printf '%s' "$resp" | jq -r '.candidates[0].content.parts[0].text // "LGTM! No structural, security, or performance issues identified."' > review.md
 
     - name: Post Review Comment
       shell: bash
@@ -135,33 +144,13 @@ runs:
       run: |
         set -euo pipefail
 
-        # -----------------------------------------------------------------
-        # 1. ULTIMATE SANITIZATION: Recursive decoding
-        #    This handles ANY level of escaping (\, \\, \\\, etc.)
-        # -----------------------------------------------------------------
-        cp review.md review_temp.md
-        
-        # Keep decoding until no literal \n remains
-        while grep -q '\\n' review_temp.md; do
-          # Use printf '%b' which interprets backslash escapes
-          content=$(cat review_temp.md)
-          printf '%b' "$content" > review_temp.md
-        done
-        
-        # Strip any leading blank lines
-        sed -i -e '/./,$!d' review_temp.md
+        # Strip any accidental duplicate literal escape sequences left behind
+        sed -i 's/\\n/\n/g' review.md
+        sed -i -e '/./,$!d' review.md
 
-        # -----------------------------------------------------------------
-        # 2. Write the header as the VERY FIRST LINE (no extra whitespace)
-        # -----------------------------------------------------------------
-        printf '%s\n' '## 🛡️ Gemini Automated Audit' > comment.md
+        # Build clean markdown document natively using real file appends
+        printf '%s\n\n' '## 🛡️ Gemini Automated Audit' > comment.md
+        cat review.md >> comment.md
 
-        # -----------------------------------------------------------------
-        # 3. Append the fully sanitized AI response
-        # -----------------------------------------------------------------
-        cat review_temp.md >> comment.md
-
-        # -----------------------------------------------------------------
-        # 4. Post the comment
-        # -----------------------------------------------------------------
+        # Post the clean text file straight to the pull request timeline
         gh pr comment "$PR" --body-file comment.md
