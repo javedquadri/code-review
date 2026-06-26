@@ -93,7 +93,7 @@ runs:
 
     - name: Post Review Comment
       shell: bash
-      if: steps.diff.outputs.skip != 'true'
+      if: ${{ steps.diff.outputs.skip != 'true' }}
       env:
         GH_TOKEN: ${{ github.token }}
         PR: ${{ github.event.pull_request.number }}
@@ -102,9 +102,9 @@ runs:
       run: |
         set -euo pipefail
         cat << EOF > comment.md
-	<!-- gemini-review:${SHA} -->
-	## 🛡️ Gemini Automated Audit
-	${BODY}
-	EOF
+<!-- gemini-review:${SHA} -->
+## 🛡️ Gemini Automated Audit
+${BODY}
+EOF
         # Post the clean Markdown file directly
         gh pr comment "$PR" --body-file comment.md
