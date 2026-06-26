@@ -87,10 +87,10 @@ runs:
            - Violations of Single Responsibility Principle.
            - Debugging leftovers: `console.log`, `debugger`, or commented-out test code.
 
-        **Output Format:**
+        **IMPORTANT OUTPUT RULES:**
         - **CRITICAL:** Do NOT include a top-level '## 🛡️ Gemini Automated Audit' header. The workflow adds this automatically.
         - Start directly with the **Analysis Tiers** (e.g., `🔴 Critical...`, `🟡 Performance...`, `🔵 Maintainability...`) or the Risk Score if no issues are found.
-        - Use valid Markdown.
+        - Use valid Markdown with real newlines, NOT literal '\n' characters.
         - If a Tier has no issues, omit that header entirely.
         - At the end, include a **Risk Score**: `✅ Safe to Merge`, `⚠️ Proceed with Caution`, or `🚨 Blocked`.
 
@@ -136,15 +136,19 @@ runs:
         set -euo pipefail
 
         # -----------------------------------------------------------------
-        # 1. ROBUST SANITIZATION:
-        #    - Convert literal '\n' and '\\n' into real newlines.
-        #    - Run perl 3 times to handle double/triple escaping.
-        #    - Strip leading blank lines.
+        # 1. ULTIMATE SANITIZATION: Recursive decoding
+        #    This handles ANY level of escaping (\, \\, \\\, etc.)
         # -----------------------------------------------------------------
         cp review.md review_temp.md
-        for i in {1..3}; do
-          perl -i -pe 's/\\n/\n/g' review_temp.md
+        
+        # Keep decoding until no literal \n remains
+        while grep -q '\\n' review_temp.md; do
+          # Use printf '%b' which interprets backslash escapes
+          content=$(cat review_temp.md)
+          printf '%b' "$content" > review_temp.md
         done
+        
+        # Strip any leading blank lines
         sed -i -e '/./,$!d' review_temp.md
 
         # -----------------------------------------------------------------
