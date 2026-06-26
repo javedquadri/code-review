@@ -6,9 +6,9 @@ inputs:
     description: 'Gemini API Key from Google AI Studio'
     required: true
   tech_stack:
-    description: 'The technology stack of the codebase (e.g., "TypeScript/React/Node.js", "Python/Django", "Go", "Rust", etc.)'
+    description: 'The technology stack (e.g., "TypeScript/React/Node.js", "Python/Django", "Go"). Leave blank for generic AI-driven detection from the diff.'
     required: false
-    default: 'TypeScript/React/Cloudflare Workers/D1'
+    default: ''
 
 runs:
   using: "composite"
@@ -46,9 +46,27 @@ runs:
       run: |
         set -euo pipefail
 
-        # Build the prompt dynamically, injecting the tech stack.
+        # -----------------------------------------------------------------
+        # 1. Build the context instruction dynamically
+        # -----------------------------------------------------------------
+        if [ -z "$TECH_STACK" ]; then
+          CONTEXT_INSTRUCTION=$(cat << 'EOF'
+        You are reviewing a Pull Request for an **unspecified codebase**.
+        **Do not assume any specific framework.**
+        Analyze the `git diff` to identify the primary language(s) and frameworks being used.
+        Focus on generic, universal principles: security vulnerabilities (OWASP Top 10),
+        performance bottlenecks (N+1 queries, O(n^2) loops), and maintainability (DRY, SOLID).
+        EOF
+        )
+        else
+          CONTEXT_INSTRUCTION="You are reviewing a Pull Request for a codebase written in: **${TECH_STACK}**."
+        fi
+
+        # -----------------------------------------------------------------
+        # 2. Define the full review prompt (with placeholders)
+        # -----------------------------------------------------------------
         PROMPT=$(cat << 'EOF'
-        You are reviewing a Pull Request for a codebase written in: **${TECH_STACK}**.
+        ${CONTEXT_INSTRUCTION}
 
         You are viewing only the `git diff`. You do not see the entire codebase.
         Focus on the **cascading impact** of these changes. If a function
@@ -57,8 +75,8 @@ runs:
 
         **Analysis Tiers (Use these exact headers):**
         1. **🔴 Critical (Blocking Merge):**
-           - Security vulnerabilities (SQL injection, XSS, exposed secrets/API keys, unsafe deserialization, etc.).
-           - Data corruption/loss risks (incorrect transaction boundaries, missing rollbacks).
+           - Security vulnerabilities (SQL injection, XSS, exposed secrets, unsafe deserialization).
+           - Data corruption/loss risks (incorrect transaction boundaries).
            - Logic that throws unhandled exceptions and crashes the runtime.
 
         2. **🟡 Performance & Scalability:**
@@ -66,9 +84,8 @@ runs:
            - Blocking I/O in async loops, memory leaks, inefficient algorithms.
 
         3. **🔵 Maintainability & Architecture:**
-           - Violations of Single Responsibility Principle or other SOLID principles.
+           - Violations of Single Responsibility Principle.
            - Debugging leftovers: `console.log`, `debugger`, or commented-out test code.
-           - Code duplication or overly complex logic.
 
         **Output Format:**
         - Use valid Markdown.
@@ -82,19 +99,34 @@ runs:
         EOF
         )
 
-        # Replace the placeholder with the actual tech stack (escape for sed)
-        PROMPT=$(echo "$PROMPT" | sed "s/\${TECH_STACK}/$TECH_STACK/g")
+        # -----------------------------------------------------------------
+        # 3. Inject the context instruction into the prompt
+        # -----------------------------------------------------------------
+        # Escape the CONTEXT_INSTRUCTION for sed (handle special chars)
+        ESCAPED_CONTEXT=$(printf '%s\n' "$CONTEXT_INSTRUCTION" | sed 's/[&/\]/\\&/g')
+        PROMPT=$(echo "$PROMPT" | sed "s/\${CONTEXT_INSTRUCTION}/$ESCAPED_CONTEXT/g")
 
+        # -----------------------------------------------------------------
+        # 4. Build the API request payload
+        # -----------------------------------------------------------------
         combined=$(printf '%s\n\nDiff:\n```diff\n%s\n```' "$PROMPT" "$DIFF_DATA")
         json=$(jq -n --arg c "$combined" '{contents:[{parts:[{text:$c}]}], generationConfig:{temperature:0.1}}')
 
+        # -----------------------------------------------------------------
+        # 5. Call Gemini API
+        # -----------------------------------------------------------------
         resp=$(curl -fsS \
           "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent" \
           -H "x-goog-api-key: ${{ inputs.gemini_api_key }}" \
           -H "Content-Type: application/json" \
           -d "$json")
 
-        # Extract, sanitize literal \n, and strip leading blank lines
+        # -----------------------------------------------------------------
+        # 6. Extract, sanitize, and save the review
+        #    - jq -r converts JSON escapes to real newlines
+        #    - perl replaces any remaining literal \n
+        #    - sed strips leading blank lines
+        # -----------------------------------------------------------------
         echo "$resp" | jq -r '.candidates[0].content.parts[0].text // "LGTM! No structural, security, or performance issues identified."' \
           | perl -pe 's/\\n/\n/g' \
           | sed -e '/./,$!d' > review.md
@@ -109,11 +141,11 @@ runs:
       run: |
         set -euo pipefail
 
-        # Write header without any leading blank lines
+        # Write the header as the very first line (no extra newlines)
         printf '%s\n' '## 🛡️ Gemini Automated Audit' > comment.md
 
-        # Append the sanitized review body (already cleaned)
+        # Append the already-sanitized review body
         cat review.md >> comment.md
 
-        # Post the comment
+        # Post the comment using the file
         gh pr comment "$PR" --body-file comment.md
