@@ -101,6 +101,10 @@ runs:
         BODY: ${{ steps.review.outputs.body }}
       run: |
         set -euo pipefail
-        marker=""
-        comment="${marker}\n\n## 🛡️ Gemini Automated Audit\n\n${BODY}"
-        gh pr comment "$PR" --body "$comment"
+        cat << EOF > comment.md
+	<!-- gemini-review:${SHA} -->
+	## 🛡️ Gemini Automated Audit
+	${BODY}
+	EOF
+        # Post the clean Markdown file directly
+        gh pr comment "$PR" --body-file comment.md
