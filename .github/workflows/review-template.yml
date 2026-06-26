@@ -2,14 +2,18 @@ name: "Gemini Shared Review Engine"
 
 on:
   workflow_call:
+    # FIX 1: Explicitly declare that this workflow accepts the secret
+    secrets:
+      GEMINI_API_KEY:
+        required: true
 
 jobs:
   review:
     name: AI Code Review
-    # FIXED: Replaced the unsupported math '+' operator with explicit separate logical checks
     if: ${{ github.event.pull_request.changed_files > 0 && github.event.pull_request.changed_files < 60 && github.event.pull_request.additions < 2000 && github.event.pull_request.deletions < 2000 }}
     runs-on: ubuntu-latest
 
+    # Keep these explicit blocks inside the engine
     permissions:
       contents: read
       pull-requests: write
@@ -112,7 +116,7 @@ jobs:
           BODY: ${{ steps.review.outputs.body }}
         run: |
           set -euo pipefail
-          marker="<!-- gemini-review:${SHA} -->"
+          marker=""
           comment="${marker}
 
           ## 🛡️ Gemini Automated Audit
