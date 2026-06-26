@@ -68,6 +68,8 @@ runs:
         - Use valid Markdown.
         - If a Tier has no issues, omit that header entirely.
         - At the end, include a **Risk Score**: `✅ Safe to Merge`, `⚠️ Proceed with Caution`, or `🚨 Blocked`.
+        
+        **CRITICAL FORMATTING RULE:** Do NOT include literal '\n' characters, raw escape strings, or markdown headers inside text strings. Output real markdown headings and standard carriage returns directly.
 
         **Final Rule:** If absolutely nothing is found, reply exactly with:
         > LGTM! No structural, security, or performance issues identified.
