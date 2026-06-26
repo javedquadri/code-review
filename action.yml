@@ -1,30 +1,39 @@
 name: 'Gemini Central Review Engine'
 description: 'Runs centralized Gemini automated PR code audits'
 
-# Composite Actions use inputs, not workflow triggers
 inputs:
   gemini_api_key:
-    description: 'Gemini API Key'
+    description: 'Gemini API Key from Google AI Studio'
     required: true
 
 runs:
   using: "composite"
   steps:
-    - name: Build diff
+    - name: Build Diff
       id: diff
       shell: bash
       run: |
         set -euo pipefail
-        # Fetching changes relative to PR targets
-        git fetch --no-tags origin "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
-        git diff "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}" > raw.patch
+        
+        # Pull the base and head targets dynamically from the active PR payload context
+        BASE_SHA="${{ github.event.pull_request.base.sha }}"
+        HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+        
+        # Fetch the exact ref commits into the runner space safely
+        git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA"
+        
+        # Build the localized branch comparison snapshot 
+        git diff "$BASE_SHA...$HEAD_SHA" > raw.patch
+        
+        # Cap the payload size to protect model context window limitations
         head -c 120000 raw.patch > diff.patch
         
+        # Pipe diff output using explicit delimiter hooks to handle multiline safely
         echo "patch<<EOF" >> "$GITHUB_OUTPUT"
         cat diff.patch >> "$GITHUB_OUTPUT"
         echo "EOF" >> "$GITHUB_OUTPUT"
 
-    - name: Gemini review
+    - name: Gemini Review
       id: review
       shell: bash
       env:
@@ -32,18 +41,52 @@ runs:
       run: |
         set -euo pipefail
 
+        # Clean prompt payload isolating logic and architectural boundaries inside the runtime
         PROMPT=$(cat << 'EOF'
-        You are reviewing a Pull Request for a **TypeScript** codebase.
-        Review the following code diff for this pull request. Provide clear feedback focusing on:
-        1. 🔴 Critical bugs or security issues.
-        2. 🟡 Performance leaks.
-        3. 🔵 Architecture and readability.
-        Format your response clearly using Markdown bullet points.
+        You are reviewing a Pull Request for a **TypeScript** codebase 
+        (React/Vite web app + Cloudflare Workers API + D1 database).
+
+        You are viewing only the `git diff`. You do not see the entire codebase.
+        Focus on the **cascading impact** of these changes. If a function
+        signature changes, check whether the caller logic still makes sense 
+        (even if the caller isn't in this exact diff chunk).
+        Do NOT comment on code formatting, indentation, or missing semicolons 
+        (linters handle that).
+
+        **Analysis Tiers (Use these exact headers):**
+        1. **🔴 Critical (Blocking Merge):**
+           - Security vulnerabilities (SQLi, XSS, command injection, exposed secrets/API keys).
+           - Data corruption/loss risks (incorrect transaction boundaries, missing rollbacks).
+           - Logic that throws unhandled exceptions and crashes the runtime.
+           - Removing or renaming public APIs / interfaces without backward compatibility.
+
+        2. **🟡 Performance & Scalability:**
+           - N+1 database queries, missing database indexes for new filters.
+           - Blocking I/O in async loops, memory leaks (e.g., uncancelled timers/listeners).
+           - Redundant iterations (O(n²) loops) on potentially large datasets.
+
+        3. **🔵 Maintainability & Architecture:**
+           - Violations of Single Responsibility Principle (massive functions > 200 lines).
+           - Mutable state modifications that cause unexpected side-effects in unrelated modules.
+           - Missing error handling for external API calls (no retry/timeout logic).
+           - Debugging leftovers: `console.log`, `print()`, `pdb`, `debugger`, or commented-out test code.
+
+        **Output Format:**
+        - Use valid Markdown.
+        - If a Tier has no issues, omit that header entirely.
+        - Provide **code suggestions** in inline `backticks` if the fix is obvious.
+        - At the end, include a **Risk Score**: `✅ Safe to Merge`, `⚠️ Proceed with Caution`, or `🚨 Blocked`.
+
+        **Final Rule:** If absolutely nothing is found, reply exactly with:
+        > LGTM! No structural, security, or performance issues identified.
         EOF
         )
 
         combined=$(printf '%s\n\nDiff:\n```diff\n%s\n```' "$PROMPT" "$DIFF_DATA")
-        json=$(jq -n --arg c "$combined" '{contents:[{parts:[{text:$c}]}], generationConfig:{temperature:0.1}}')
+        
+        # Use jq argument parameters to perfectly escape text structures and markdown blocks
+        json=$(jq -n --arg c "$combined" \
+          '{contents:[{parts:[{text:$c}]}], generationConfig:{temperature:0.1}}')
 
         resp=$(curl -fsS \
           "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent" \
@@ -51,13 +94,13 @@ runs:
           -H "Content-Type: application/json" \
           -d "$json")
 
-        text=$(printf '%s' "$resp" | jq -r '.candidates[0].content.parts[0].text // "LGTM!"')
+        text=$(printf '%s' "$resp" | jq -r '.candidates[0].content.parts[0].text // "LGTM! No structural, security, or performance issues identified."')
         
         echo "body<<EOF" >> "$GITHUB_OUTPUT"
         printf '%s\n' "$text" >> "$GITHUB_OUTPUT"
         echo "EOF" >> "$GITHUB_OUTPUT"
 
-    - name: Post review comment
+    - name: Post Review Comment
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
@@ -66,6 +109,13 @@ runs:
         BODY: ${{ steps.review.outputs.body }}
       run: |
         set -euo pipefail
+        
         marker=""
-        comment="${marker}\n\n## 🛡️ Gemini Automated Audit\n\n${BODY}"
+        comment="${marker}
+
+        ## 🛡️ Gemini Automated Audit
+
+        ${BODY}"
+        
+        # Posts the feedback comment inline to the pull request via GitHub CLI
         gh pr comment "$PR" --body "$comment"
