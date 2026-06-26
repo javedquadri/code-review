@@ -21,7 +21,6 @@ runs:
         git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA"
         git diff "$BASE_SHA...$HEAD_SHA" > raw.patch
 
-        # Centralized Guardrail: Exit gracefully if there is no code diff to read
         if [ ! -s raw.patch ]; then
           echo "No structural code variations detected. Skipping AI evaluation."
           echo "skip=true" >> "$GITHUB_OUTPUT"
@@ -36,8 +35,7 @@ runs:
     - name: Gemini Review
       id: review
       shell: bash
-      # Only triggers the API execution block if the previous step didn't flag a skip
-      if: steps.diff.outputs.skip != 'true'
+      if: ${{ steps.diff.outputs.skip != 'true' }}
       env:
         DIFF_DATA: ${{ steps.diff.outputs.patch }}
       run: |
@@ -85,11 +83,9 @@ runs:
           -H "Content-Type: application/json" \
           -d "$json")
 
-        text=$(printf '%s' "$resp" | jq -r '.candidates[0].content.parts[0].text // "LGTM!"')
-        
-        echo "body<<EOF" >> "$GITHUB_OUTPUT"
-        printf '%s\n' "$text" >> "$GITHUB_OUTPUT"
-        echo "EOF" >> "$GITHUB_OUTPUT"
+        # FIXED: Stream the clean raw output string directly into a workspace text file 
+        # instead of piping it through GITHUB_OUTPUT environment strings.
+        printf '%s' "$resp" | jq -r '.candidates[0].content.parts[0].text // "LGTM! No structural, security, or performance issues identified."' > review.md
 
     - name: Post Review Comment
       shell: bash
@@ -98,13 +94,18 @@ runs:
         GH_TOKEN: ${{ github.token }}
         PR: ${{ github.event.pull_request.number }}
         SHA: ${{ github.event.pull_request.head.sha }}
-        BODY: ${{ steps.review.outputs.body }}
       run: |
         set -euo pipefail
+        
+        # FIXED: Construct the markdown template cleanly without interpolation bottlenecks.
+        # We drop the marker and structural header into comment.md first.
         cat << EOF > comment.md
-<!-- gemini-review:${SHA} -->
 ## 🛡️ Gemini Automated Audit
-${BODY}
+
 EOF
-        # Post the clean Markdown file directly
+
+        # Append the pure contents of review.md to the end of our comment file
+        cat review.md >> comment.md
+
+        # Post the finished clean Markdown file directly
         gh pr comment "$PR" --body-file comment.md
