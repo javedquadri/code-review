@@ -1,10 +1,14 @@
 name: 'Gemini Central Review Engine'
-description: 'Centralized, low-maintenance TypeScript/Cloudflare PR review action'
+description: 'Centralized, language-agnostic PR review action using Gemini'
 
 inputs:
   gemini_api_key:
     description: 'Gemini API Key from Google AI Studio'
     required: true
+  tech_stack:
+    description: 'The technology stack of the codebase (e.g., "TypeScript/React/Node.js", "Python/Django", "Go", "Rust", etc.)'
+    required: false
+    default: 'TypeScript/React/Cloudflare Workers/D1'
 
 runs:
   using: "composite"
@@ -38,12 +42,13 @@ runs:
       if: ${{ steps.diff.outputs.skip != 'true' }}
       env:
         DIFF_DATA: ${{ steps.diff.outputs.patch }}
+        TECH_STACK: ${{ inputs.tech_stack }}
       run: |
         set -euo pipefail
 
+        # Build the prompt dynamically, injecting the tech stack.
         PROMPT=$(cat << 'EOF'
-        You are reviewing a Pull Request for a **TypeScript** codebase 
-        (React/Vite web app + Cloudflare Workers API + D1 database).
+        You are reviewing a Pull Request for a codebase written in: **${TECH_STACK}**.
 
         You are viewing only the `git diff`. You do not see the entire codebase.
         Focus on the **cascading impact** of these changes. If a function
@@ -52,29 +57,33 @@ runs:
 
         **Analysis Tiers (Use these exact headers):**
         1. **🔴 Critical (Blocking Merge):**
-           - Security vulnerabilities (SQLi, XSS, exposed secrets/API keys).
-           - Data corruption/loss risks (incorrect transaction boundaries).
+           - Security vulnerabilities (SQL injection, XSS, exposed secrets/API keys, unsafe deserialization, etc.).
+           - Data corruption/loss risks (incorrect transaction boundaries, missing rollbacks).
            - Logic that throws unhandled exceptions and crashes the runtime.
 
         2. **🟡 Performance & Scalability:**
-           - N+1 database queries, missing database indexes for new filters.
-           - Blocking I/O in async loops, memory leaks.
+           - N+1 queries, missing database indexes for new filters.
+           - Blocking I/O in async loops, memory leaks, inefficient algorithms.
 
         3. **🔵 Maintainability & Architecture:**
-           - Violations of Single Responsibility Principle.
+           - Violations of Single Responsibility Principle or other SOLID principles.
            - Debugging leftovers: `console.log`, `debugger`, or commented-out test code.
+           - Code duplication or overly complex logic.
 
         **Output Format:**
         - Use valid Markdown.
         - If a Tier has no issues, omit that header entirely.
         - At the end, include a **Risk Score**: `✅ Safe to Merge`, `⚠️ Proceed with Caution`, or `🚨 Blocked`.
-        
+
         **CRITICAL FORMATTING RULE:** Do NOT include literal '\n' characters, raw escape strings, or markdown headers inside text strings. Output real markdown headings and standard carriage returns directly.
 
         **Final Rule:** If absolutely nothing is found, reply exactly with:
         > LGTM! No structural, security, or performance issues identified.
         EOF
         )
+
+        # Replace the placeholder with the actual tech stack (escape for sed)
+        PROMPT=$(echo "$PROMPT" | sed "s/\${TECH_STACK}/$TECH_STACK/g")
 
         combined=$(printf '%s\n\nDiff:\n```diff\n%s\n```' "$PROMPT" "$DIFF_DATA")
         json=$(jq -n --arg c "$combined" '{contents:[{parts:[{text:$c}]}], generationConfig:{temperature:0.1}}')
@@ -85,9 +94,10 @@ runs:
           -H "Content-Type: application/json" \
           -d "$json")
 
-        # FIXED: Stream the clean raw output string directly into a workspace text file 
-        # instead of piping it through GITHUB_OUTPUT environment strings.
-        printf '%s' "$resp" | jq -r '.candidates[0].content.parts[0].text // "LGTM! No structural, security, or performance issues identified."' > review.md
+        # Extract, sanitize literal \n, and strip leading blank lines
+        echo "$resp" | jq -r '.candidates[0].content.parts[0].text // "LGTM! No structural, security, or performance issues identified."' \
+          | perl -pe 's/\\n/\n/g' \
+          | sed -e '/./,$!d' > review.md
 
     - name: Post Review Comment
       shell: bash
@@ -98,16 +108,12 @@ runs:
         SHA: ${{ github.event.pull_request.head.sha }}
       run: |
         set -euo pipefail
-        
-        # FIXED: Construct the markdown template cleanly without interpolation bottlenecks.
-        # We drop the marker and structural header into comment.md first.
-        cat << EOF > comment.md
-## 🛡️ Gemini Automated Audit
 
-EOF
+        # Write header without any leading blank lines
+        printf '%s\n' '## 🛡️ Gemini Automated Audit' > comment.md
 
-        # Append the pure contents of review.md to the end of our comment file
+        # Append the sanitized review body (already cleaned)
         cat review.md >> comment.md
 
-        # Post the finished clean Markdown file directly
+        # Post the comment
         gh pr comment "$PR" --body-file comment.md
