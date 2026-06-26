@@ -102,7 +102,6 @@ runs:
         # -----------------------------------------------------------------
         # 3. Inject the context instruction into the prompt
         # -----------------------------------------------------------------
-        # Escape the CONTEXT_INSTRUCTION for sed (handle special chars)
         ESCAPED_CONTEXT=$(printf '%s\n' "$CONTEXT_INSTRUCTION" | sed 's/[&/\]/\\&/g')
         PROMPT=$(echo "$PROMPT" | sed "s/\${CONTEXT_INSTRUCTION}/$ESCAPED_CONTEXT/g")
 
@@ -122,14 +121,9 @@ runs:
           -d "$json")
 
         # -----------------------------------------------------------------
-        # 6. Extract, sanitize, and save the review
-        #    - jq -r converts JSON escapes to real newlines
-        #    - perl replaces any remaining literal \n
-        #    - sed strips leading blank lines
+        # 6. Extract the response and save it raw (we'll clean it in the next step)
         # -----------------------------------------------------------------
-        echo "$resp" | jq -r '.candidates[0].content.parts[0].text // "LGTM! No structural, security, or performance issues identified."' \
-          | perl -pe 's/\\n/\n/g' \
-          | sed -e '/./,$!d' > review.md
+        echo "$resp" | jq -r '.candidates[0].content.parts[0].text // "LGTM! No structural, security, or performance issues identified."' > review.md
 
     - name: Post Review Comment
       shell: bash
@@ -141,11 +135,25 @@ runs:
       run: |
         set -euo pipefail
 
-        # Write the header as the very first line (no extra newlines)
+        # -----------------------------------------------------------------
+        # 1. Read the raw review and interpret backslash escapes (like \n)
+        #    printf '%b' converts literal '\n' to real newlines
+        #    then sed strips any leading blank lines
+        # -----------------------------------------------------------------
+        review_content=$(cat review.md)
+        printf '%b' "$review_content" | sed -e '/./,$!d' > review_clean.md
+
+        # -----------------------------------------------------------------
+        # 2. Write the header as the very first line (no extra whitespace)
+        # -----------------------------------------------------------------
         printf '%s\n' '## 🛡️ Gemini Automated Audit' > comment.md
 
-        # Append the already-sanitized review body
-        cat review.md >> comment.md
+        # -----------------------------------------------------------------
+        # 3. Append the sanitized review body
+        # -----------------------------------------------------------------
+        cat review_clean.md >> comment.md
 
-        # Post the comment using the file
+        # -----------------------------------------------------------------
+        # 4. Post the comment using the file
+        # -----------------------------------------------------------------
         gh pr comment "$PR" --body-file comment.md
