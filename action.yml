@@ -1,0 +1,71 @@
+name: 'Gemini Central Review Engine'
+description: 'Runs centralized Gemini automated PR code audits'
+
+# Composite Actions use inputs, not workflow triggers
+inputs:
+  gemini_api_key:
+    description: 'Gemini API Key'
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Build diff
+      id: diff
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Fetching changes relative to PR targets
+        git fetch --no-tags origin "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
+        git diff "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}" > raw.patch
+        head -c 120000 raw.patch > diff.patch
+        
+        echo "patch<<EOF" >> "$GITHUB_OUTPUT"
+        cat diff.patch >> "$GITHUB_OUTPUT"
+        echo "EOF" >> "$GITHUB_OUTPUT"
+
+    - name: Gemini review
+      id: review
+      shell: bash
+      env:
+        DIFF_DATA: ${{ steps.diff.outputs.patch }}
+      run: |
+        set -euo pipefail
+
+        PROMPT=$(cat << 'EOF'
+        You are reviewing a Pull Request for a **TypeScript** codebase.
+        Review the following code diff for this pull request. Provide clear feedback focusing on:
+        1. 🔴 Critical bugs or security issues.
+        2. 🟡 Performance leaks.
+        3. 🔵 Architecture and readability.
+        Format your response clearly using Markdown bullet points.
+        EOF
+        )
+
+        combined=$(printf '%s\n\nDiff:\n```diff\n%s\n```' "$PROMPT" "$DIFF_DATA")
+        json=$(jq -n --arg c "$combined" '{contents:[{parts:[{text:$c}]}], generationConfig:{temperature:0.1}}')
+
+        resp=$(curl -fsS \
+          "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent" \
+          -H "x-goog-api-key: ${{ inputs.gemini_api_key }}" \
+          -H "Content-Type: application/json" \
+          -d "$json")
+
+        text=$(printf '%s' "$resp" | jq -r '.candidates[0].content.parts[0].text // "LGTM!"')
+        
+        echo "body<<EOF" >> "$GITHUB_OUTPUT"
+        printf '%s\n' "$text" >> "$GITHUB_OUTPUT"
+        echo "EOF" >> "$GITHUB_OUTPUT"
+
+    - name: Post review comment
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PR: ${{ github.event.pull_request.number }}
+        SHA: ${{ github.event.pull_request.head.sha }}
+        BODY: ${{ steps.review.outputs.body }}
+      run: |
+        set -euo pipefail
+        marker=""
+        comment="${marker}\n\n## 🛡️ Gemini Automated Audit\n\n${BODY}"
+        gh pr comment "$PR" --body "$comment"
