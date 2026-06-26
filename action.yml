@@ -88,11 +88,11 @@ runs:
            - Debugging leftovers: `console.log`, `debugger`, or commented-out test code.
 
         **Output Format:**
+        - **CRITICAL:** Do NOT include a top-level '## 🛡️ Gemini Automated Audit' header. The workflow adds this automatically.
+        - Start directly with the **Analysis Tiers** (e.g., `🔴 Critical...`, `🟡 Performance...`, `🔵 Maintainability...`) or the Risk Score if no issues are found.
         - Use valid Markdown.
         - If a Tier has no issues, omit that header entirely.
         - At the end, include a **Risk Score**: `✅ Safe to Merge`, `⚠️ Proceed with Caution`, or `🚨 Blocked`.
-
-        **CRITICAL FORMATTING RULE:** Do NOT include literal '\n' characters, raw escape strings, or markdown headers inside text strings. Output real markdown headings and standard carriage returns directly.
 
         **Final Rule:** If absolutely nothing is found, reply exactly with:
         > LGTM! No structural, security, or performance issues identified.
@@ -121,7 +121,7 @@ runs:
           -d "$json")
 
         # -----------------------------------------------------------------
-        # 6. Extract the response and save it raw (we'll clean it in the next step)
+        # 6. Extract the raw AI response
         # -----------------------------------------------------------------
         echo "$resp" | jq -r '.candidates[0].content.parts[0].text // "LGTM! No structural, security, or performance issues identified."' > review.md
 
@@ -136,24 +136,28 @@ runs:
         set -euo pipefail
 
         # -----------------------------------------------------------------
-        # 1. Read the raw review and interpret backslash escapes (like \n)
-        #    printf '%b' converts literal '\n' to real newlines
-        #    then sed strips any leading blank lines
+        # 1. ROBUST SANITIZATION:
+        #    - Convert literal '\n' and '\\n' into real newlines.
+        #    - Run perl 3 times to handle double/triple escaping.
+        #    - Strip leading blank lines.
         # -----------------------------------------------------------------
-        review_content=$(cat review.md)
-        printf '%b' "$review_content" | sed -e '/./,$!d' > review_clean.md
+        cp review.md review_temp.md
+        for i in {1..3}; do
+          perl -i -pe 's/\\n/\n/g' review_temp.md
+        done
+        sed -i -e '/./,$!d' review_temp.md
 
         # -----------------------------------------------------------------
-        # 2. Write the header as the very first line (no extra whitespace)
+        # 2. Write the header as the VERY FIRST LINE (no extra whitespace)
         # -----------------------------------------------------------------
         printf '%s\n' '## 🛡️ Gemini Automated Audit' > comment.md
 
         # -----------------------------------------------------------------
-        # 3. Append the sanitized review body
+        # 3. Append the fully sanitized AI response
         # -----------------------------------------------------------------
-        cat review_clean.md >> comment.md
+        cat review_temp.md >> comment.md
 
         # -----------------------------------------------------------------
-        # 4. Post the comment using the file
+        # 4. Post the comment
         # -----------------------------------------------------------------
         gh pr comment "$PR" --body-file comment.md
