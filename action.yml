@@ -68,16 +68,12 @@ runs:
         fi
         
         echo "skip=false" >> "$GITHUB_OUTPUT"
-        echo "patch<<EOF" >> "$GITHUB_OUTPUT"
-        cat raw.patch >> "$GITHUB_OUTPUT"
-        echo "EOF" >> "$GITHUB_OUTPUT"
 
     - name: AI Review with Gemini + DeepSeek Fallback
       id: review
       if: steps.diff.outputs.skip != 'true'
       shell: bash
       env:
-        DIFF_DATA: ${{ steps.diff.outputs.patch }}
         TECH_STACK: ${{ inputs.tech_stack }}
         PRIMARY_MODEL: ${{ inputs.model }}
         FALLBACK_GEMINI_MODEL: ${{ inputs.fallback_gemini_model }}
@@ -88,7 +84,21 @@ runs:
         set -euo pipefail
 
         # -----------------------------------------------------------------
-        # 1. Build the prompt
+        # 1. Truncate oversized diffs to avoid argument/request limits
+        # -----------------------------------------------------------------
+        MAX_DIFF=200000
+        if [ -f raw.patch ]; then
+          size=$(wc -c < raw.patch)
+          if [ "$size" -gt "$MAX_DIFF" ]; then
+            echo "⚠️ Diff too large (${size} bytes). Truncating to ${MAX_DIFF} bytes."
+            head -c "$MAX_DIFF" raw.patch > raw.truncated.patch
+            printf '\n\n--- PATCH TRUNCATED: original was %s bytes. Review may be incomplete. ---\n\n' "$size" >> raw.truncated.patch
+            mv raw.truncated.patch raw.patch
+          fi
+        fi
+
+        # -----------------------------------------------------------------
+        # 2. Build the prompt into a temp file (no large shell vars)
         # -----------------------------------------------------------------
         if [ -z "$TECH_STACK" ]; then
           CONTEXT_INSTRUCTION=$(cat << 'EOF'
@@ -136,18 +146,24 @@ runs:
 
         ESCAPED_CONTEXT=$(printf '%s\n' "$CONTEXT_INSTRUCTION" | sed 's/[&/\]/\\&/g')
         PROMPT=$(echo "$PROMPT" | sed "s/\${CONTEXT_INSTRUCTION}/$ESCAPED_CONTEXT/g")
-        combined=$(printf '%s\n\nDiff:\n```diff\n%s\n```' "$PROMPT" "$DIFF_DATA")
+
+        # Build full content (prompt + diff) into a temp file
+        COMBINED_FILE=$(mktemp)
+        printf '%s\n\nDiff:\n```diff\n' "$PROMPT" > "$COMBINED_FILE"
+        cat raw.patch >> "$COMBINED_FILE"
+        printf '\n```' >> "$COMBINED_FILE"
 
         # -----------------------------------------------------------------
-        # 2. Helper: Call Gemini
+        # 3. Helper: Call Gemini (file-based, no large args)
         # -----------------------------------------------------------------
         call_gemini() {
           local model="$1"
           local out_file="$2"
           local status_file="$3"
           
-          local json
-          json=$(jq -n --arg c "$combined" '{contents:[{parts:[{text:$c}]}], generationConfig:{temperature:0.1}}')
+          local json_file
+          json_file=$(mktemp)
+          jq -n --rawfile c "$COMBINED_FILE" '{contents:[{parts:[{text:$c}]}], generationConfig:{temperature:0.1}}' > "$json_file"
           
           local response_file
           response_file=$(mktemp)
@@ -157,13 +173,13 @@ runs:
             --retry 2 --retry-delay 2 \
             -H "x-goog-api-key: $GEMINI_KEY" \
             -H "Content-Type: application/json" \
-            -d "$json" \
+            -d @"$json_file" \
             "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent")
           
           if [ "$http_code" -eq 200 ]; then
             jq -r '.candidates[0].content.parts[0].text // "LGTM! No structural, security, or performance issues identified."' "$response_file" > "$out_file"
             echo "SUCCESS" > "$status_file"
-            rm -f "$response_file"
+            rm -f "$response_file" "$json_file"
             return 0
           else
             if [ "$http_code" -eq 429 ]; then
@@ -173,25 +189,26 @@ runs:
             else
               echo "ERROR_$http_code" > "$status_file"
             fi
-            rm -f "$response_file"
+            rm -f "$response_file" "$json_file"
             return 1
           fi
         }
 
         # -----------------------------------------------------------------
-        # 3. Helper: Call DeepSeek
+        # 4. Helper: Call DeepSeek (file-based, no large args)
         # -----------------------------------------------------------------
         call_deepseek() {
           local model="$1"
           local out_file="$2"
           
-          local json
-          json=$(jq -n --arg m "$model" --arg c "$combined" '{
+          local json_file
+          json_file=$(mktemp)
+          jq -n --arg m "$model" --rawfile c "$COMBINED_FILE" '{
             model: $m,
             messages: [{role: "user", content: $c}],
             temperature: 0.1,
             stream: false
-          }')
+          }' > "$json_file"
           
           local response_file
           response_file=$(mktemp)
@@ -201,21 +218,21 @@ runs:
             --retry 2 --retry-delay 2 \
             -H "Authorization: Bearer $DEEPSEEK_KEY" \
             -H "Content-Type: application/json" \
-            -d "$json" \
+            -d @"$json_file" \
             "https://api.deepseek.com/chat/completions")
           
           if [ "$http_code" -eq 200 ]; then
             jq -r '.choices[0].message.content // "LGTM! No structural, security, or performance issues identified."' "$response_file" > "$out_file"
-            rm -f "$response_file"
+            rm -f "$response_file" "$json_file"
             return 0
           else
-            rm -f "$response_file"
+            rm -f "$response_file" "$json_file"
             return 1
           fi
         }
 
         # -----------------------------------------------------------------
-        # 4. Execute fallback chain
+        # 5. Execute fallback chain
         # -----------------------------------------------------------------
         STATUS_SIGNAL=$(mktemp)
         OUT_PAYLOAD=$(mktemp)
@@ -249,7 +266,7 @@ runs:
           echo "⚠️ Automated review engine systems are currently heavily throttled. Please proceed with standard human peer review checks." > review.md
         fi
 
-        rm -f "$STATUS_SIGNAL" "$OUT_PAYLOAD"
+        rm -f "$STATUS_SIGNAL" "$OUT_PAYLOAD" "$COMBINED_FILE"
 
     - name: Post Review Comment
       shell: bash
@@ -260,10 +277,10 @@ runs:
       run: |
         set -euo pipefail
 
-        sed -i 's/\\n/\n/g' review.md
+        perl -i -pe 's/\\n/\n/g' review.md
         sed -i -e '/./,$!d' review.md
 
-        printf '%s\n\n' '## 🛡️ AI Automated Audit' > comment.md
+        printf '## 🛡️ AI Automated Audit\n\n' > comment.md
         cat review.md >> comment.md
 
         gh pr comment "$PR" --body-file comment.md
