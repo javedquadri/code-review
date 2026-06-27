@@ -31,7 +31,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: javedquadri/gemini-code-review@main
+      - uses: javedquadri/code-review@main
         with:
           gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
 ```
@@ -39,7 +39,7 @@ jobs:
 ### With DeepSeek Fallback
 
 ```yaml
-- uses: javedquadri/gemini-code-review@main
+- uses: javedquadri/code-review@main
   with:
     gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
     deepseek_api_key: ${{ secrets.DEEPSEEK_API_KEY }}
@@ -48,7 +48,7 @@ jobs:
 ### Customizing Models
 
 ```yaml
-- uses: javedquadri/gemini-code-review@main
+- uses: javedquadri/code-review@main
   with:
     gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
     model: gemini-2.5-pro
