@@ -62,8 +62,8 @@ jobs:
 |-------|----------|---------|-------------|
 | `gemini_api_key` | Yes | — | Gemini API key from [Google AI Studio](https://aistudio.google.com/apikey) |
 | `deepseek_api_key` | No | `''` | DeepSeek API key for fallback |
-| `model` | No | `gemini-2.5-flash` | Primary Gemini model |
-| `fallback_gemini_model` | No | `gemini-3.5-flash` | Fallback Gemini model if primary fails |
+| `model` | No | `gemini-3.5-flash` | Primary Gemini model |
+| `fallback_gemini_model` | No | `gemini-2.5-flash` | Fallback Gemini model if primary fails |
 | `deepseek_model` | No | `deepseek-v4-flash` | DeepSeek model for final fallback |
 | `tech_stack` | No | `''` | Tech stack description (e.g. `Python/Django`). Leave blank for auto-detection |
 | `max_changed_lines` | No | `3000` | Skip review if total changed lines exceeds this |

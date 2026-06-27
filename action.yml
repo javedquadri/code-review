@@ -12,11 +12,11 @@ inputs:
   model:
     description: 'Primary Gemini model'
     required: false
-    default: 'gemini-2.5-flash'
+    default: 'gemini-3.5-flash'
   fallback_gemini_model:
     description: 'Fallback Gemini model if primary fails'
     required: false
-    default: 'gemini-3.5-flash'
+    default: 'gemini-2.5-flash'
   deepseek_model:
     description: 'DeepSeek model to use as fallback'
     required: false
