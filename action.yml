@@ -101,51 +101,48 @@ runs:
         # 2. Build the prompt into a temp file (no large shell vars)
         # -----------------------------------------------------------------
         if [ -z "$TECH_STACK" ]; then
-          CONTEXT_INSTRUCTION=$(cat << 'EOF'
-        You are reviewing a Pull Request for an **unspecified codebase**.
-        **Do not assume any specific framework.**
-        Analyze the `git diff` to identify the primary language(s) and frameworks being used.
-        Focus on generic, universal principles: security vulnerabilities (OWASP Top 10),
-        performance bottlenecks (N+1 queries, O(n^2) loops), and maintainability (DRY, SOLID).
-        EOF
-        )
+          CONTEXT_INSTRUCTION=$(cat << 'CONTEXTEOF'
+You are reviewing a Pull Request for an **unspecified codebase**.
+**Do not assume any specific framework.**
+Analyze the `git diff` to identify the primary language(s) and frameworks being used.
+Focus on generic, universal principles: security vulnerabilities (OWASP Top 10),
+performance bottlenecks (N+1 queries, O(n^2) loops), and maintainability (DRY, SOLID).
+CONTEXTEOF
+          )
         else
           CONTEXT_INSTRUCTION="You are reviewing a Pull Request for a codebase written in: **${TECH_STACK}**."
         fi
 
-        PROMPT=$(cat << 'EOF'
-        ${CONTEXT_INSTRUCTION}
+        PROMPT=$(cat << PROMPTEOF
+${CONTEXT_INSTRUCTION}
 
-        You are viewing only the `git diff`. Focus on **cascading impact**.
-        Do NOT comment on formatting, indentation, or missing semicolons.
+You are viewing only the \`git diff\`. Focus on **cascading impact**.
+Do NOT comment on formatting, indentation, or missing semicolons.
 
-        **Analysis Tiers:**
-        1. **🔴 Critical (Blocking Merge):**
-           - Security vulnerabilities (SQLi, XSS, exposed secrets).
-           - Data corruption/loss risks (bad transaction boundaries).
-           - Unhandled exceptions that crash the runtime.
+**Analysis Tiers:**
+1. **🔴 Critical (Blocking Merge):**
+   - Security vulnerabilities (SQLi, XSS, exposed secrets).
+   - Data corruption/loss risks (bad transaction boundaries).
+   - Unhandled exceptions that crash the runtime.
 
-        2. **🟡 Performance & Scalability:**
-           - N+1 queries, missing indexes.
-           - Blocking I/O in async loops, memory leaks.
-           - Inefficient algorithms (O(n²)).
+2. **🟡 Performance & Scalability:**
+   - N+1 queries, missing indexes.
+   - Blocking I/O in async loops, memory leaks.
+   - Inefficient algorithms (O(n²)).
 
-        3. **🔵 Maintainability & Architecture:**
-           - SRP violations (functions > 200 lines).
-           - Debugging leftovers: `console.log`, `debugger`, `pdb`.
+3. **🔵 Maintainability & Architecture:**
+   - SRP violations (functions > 200 lines).
+   - Debugging leftovers: \`console.log\`, \`debugger\`, \`pdb\`.
 
-        **OUTPUT RULES:**
-        - Start directly with the Analysis Tiers or Risk Score.
-        - If a Tier has no issues, omit it.
-        - **MUST end with a Risk Score:** `✅ Safe to Merge`, `⚠️ Proceed with Caution`, or `🚨 Blocked`.
+**OUTPUT RULES:**
+- Start directly with the Analysis Tiers or Risk Score.
+- If a Tier has no issues, omit it.
+- **MUST end with a Risk Score:** \`✅ Safe to Merge\`, \`⚠️ Proceed with Caution\`, or \`🚨 Blocked\`.
 
-        **Final Rule:** If nothing is found, reply exactly:
-        > LGTM! No structural, security, or performance issues identified.
-        EOF
+**Final Rule:** If nothing is found, reply exactly:
+> LGTM! No structural, security, or performance issues identified.
+PROMPTEOF
         )
-
-        ESCAPED_CONTEXT=$(printf '%s\n' "$CONTEXT_INSTRUCTION" | sed 's/[&/\]/\\&/g')
-        PROMPT=$(echo "$PROMPT" | sed "s/\${CONTEXT_INSTRUCTION}/$ESCAPED_CONTEXT/g")
 
         # Build full content (prompt + diff) into a temp file
         COMBINED_FILE=$(mktemp)
