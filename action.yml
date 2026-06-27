@@ -1,19 +1,43 @@
 name: 'Gemini Central Review Engine'
-description: 'Centralized, language-agnostic PR review action using Gemini'
+description: 'Centralized PR review using Gemini with DeepSeek fallback'
 
 inputs:
   gemini_api_key:
     description: 'Gemini API Key from Google AI Studio'
     required: true
-  tech_stack:
-    description: 'The technology stack (e.g., "TypeScript/React/Node.js", "Python/Django", "Go"). Leave blank for generic AI-driven detection from the diff.'
+  deepseek_api_key:
+    description: 'DeepSeek API Key (fallback provider)'
     required: false
     default: ''
+  model:
+    description: 'Primary Gemini model'
+    required: false
+    default: 'gemini-2.5-flash'
+  fallback_gemini_model:
+    description: 'Fallback Gemini model if primary fails'
+    required: false
+    default: 'gemini-3.5-flash'
+  deepseek_model:
+    description: 'DeepSeek model to use as fallback'
+    required: false
+    default: 'deepseek-v4-flash'
+  tech_stack:
+    description: 'Tech stack (e.g., "TypeScript/React"). Leave blank for AI detection.'
+    required: false
+    default: ''
+  max_changed_lines:
+    description: 'Max total lines before skipping review'
+    required: false
+    default: '3000'
+  max_changed_files:
+    description: 'Max changed files before skipping review'
+    required: false
+    default: '60'
 
 runs:
   using: "composite"
   steps:
-    - name: Evaluate and Build Diff
+    - name: Evaluate Diff and Check PR Size
       id: diff
       shell: bash
       run: |
@@ -26,8 +50,20 @@ runs:
         git diff "$BASE_SHA...$HEAD_SHA" > raw.patch
 
         if [ ! -s raw.patch ]; then
-          echo "No structural code variations detected. Skipping AI evaluation."
           echo "skip=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        ADDITIONS=${{ github.event.pull_request.additions }}
+        DELETIONS=${{ github.event.pull_request.deletions }}
+        FILES=${{ github.event.pull_request.changed_files }}
+        TOTAL=$((ADDITIONS + DELETIONS))
+        MAX_LINES=${{ inputs.max_changed_lines }}
+        MAX_FILES=${{ inputs.max_changed_files }}
+
+        if [ "$TOTAL" -gt "$MAX_LINES" ] || [ "$FILES" -gt "$MAX_FILES" ]; then
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+          echo "⚠️ Skipped: PR has ${TOTAL} lines / ${FILES} files (limits: ${MAX_LINES} lines / ${MAX_FILES} files)." 
           exit 0
         fi
         
@@ -36,17 +72,23 @@ runs:
         cat raw.patch >> "$GITHUB_OUTPUT"
         echo "EOF" >> "$GITHUB_OUTPUT"
 
-    - name: Gemini Review
+    - name: AI Review with Gemini + DeepSeek Fallback
       id: review
+      if: steps.diff.outputs.skip != 'true'
       shell: bash
-      if:     env:
+      env:
         DIFF_DATA: ${{ steps.diff.outputs.patch }}
         TECH_STACK: ${{ inputs.tech_stack }}
+        PRIMARY_MODEL: ${{ inputs.model }}
+        FALLBACK_GEMINI_MODEL: ${{ inputs.fallback_gemini_model }}
+        DEEPSEEK_MODEL: ${{ inputs.deepseek_model }}
+        GEMINI_KEY: ${{ inputs.gemini_api_key }}
+        DEEPSEEK_KEY: ${{ inputs.deepseek_api_key }}
       run: |
         set -euo pipefail
 
         # -----------------------------------------------------------------
-        # 1. Build the context instruction dynamically
+        # 1. Build the prompt
         # -----------------------------------------------------------------
         if [ -z "$TECH_STACK" ]; then
           CONTEXT_INSTRUCTION=$(cat << 'EOF'
@@ -61,96 +103,167 @@ runs:
           CONTEXT_INSTRUCTION="You are reviewing a Pull Request for a codebase written in: **${TECH_STACK}**."
         fi
 
-        # -----------------------------------------------------------------
-        # 2. Define the full review prompt (with placeholders)
-        # -----------------------------------------------------------------
         PROMPT=$(cat << 'EOF'
         ${CONTEXT_INSTRUCTION}
 
-        You are viewing only the `git diff`. You do not see the entire codebase.
-        Focus on the **cascading impact** of these changes. If a function
-        signature changes, check whether the caller logic still makes sense.
-        Do NOT comment on code formatting, indentation, or missing semicolons.
+        You are viewing only the `git diff`. Focus on **cascading impact**.
+        Do NOT comment on formatting, indentation, or missing semicolons.
 
-        **Analysis Tiers (Use these exact headers):**
+        **Analysis Tiers:**
         1. **🔴 Critical (Blocking Merge):**
-           - Security vulnerabilities (SQL injection, XSS, exposed secrets, unsafe deserialization).
-           - Data corruption/loss risks (incorrect transaction boundaries).
-           - Logic that throws unhandled exceptions and crashes the runtime.
+           - Security vulnerabilities (SQLi, XSS, exposed secrets).
+           - Data corruption/loss risks (bad transaction boundaries).
+           - Unhandled exceptions that crash the runtime.
 
         2. **🟡 Performance & Scalability:**
-           - N+1 queries, missing database indexes for new filters.
-           - Blocking I/O in async loops, memory leaks, inefficient algorithms.
+           - N+1 queries, missing indexes.
+           - Blocking I/O in async loops, memory leaks.
+           - Inefficient algorithms (O(n²)).
 
         3. **🔵 Maintainability & Architecture:**
-           - Violations of Single Responsibility Principle.
-           - Debugging leftovers: `console.log`, `debugger`, or commented-out test code.
+           - SRP violations (functions > 200 lines).
+           - Debugging leftovers: `console.log`, `debugger`, `pdb`.
 
-        **IMPORTANT OUTPUT RULES:**
-        - **CRITICAL:** Do NOT include a top-level '## 🛡️ Gemini Automated Audit' header. The workflow adds this automatically.
-        - Start directly with the **Analysis Tiers** (e.g., `🔴 Critical...`, `🟡 Performance...`, `🔵 Maintainability...`) or the Risk Score if no issues are found.
-        - Use valid Markdown with real newlines, NOT literal '\n' characters.
-        - If a Tier has no issues, omit that header entirely.
-        - **CRITICAL COMPLIANCE:** You MUST always end the review with a **Risk Score** header line showing either: `✅ Safe to Merge`, `⚠️ Proceed with Caution`, or `🚨 Blocked`. Do not drop this section.
+        **OUTPUT RULES:**
+        - Start directly with the Analysis Tiers or Risk Score.
+        - If a Tier has no issues, omit it.
+        - **MUST end with a Risk Score:** `✅ Safe to Merge`, `⚠️ Proceed with Caution`, or `🚨 Blocked`.
 
-        **Final Rule:** If absolutely nothing is found, reply exactly with:
+        **Final Rule:** If nothing is found, reply exactly:
         > LGTM! No structural, security, or performance issues identified.
         EOF
         )
 
-        # -----------------------------------------------------------------
-        # 3. Inject the context instruction into the prompt
-        # -----------------------------------------------------------------
         ESCAPED_CONTEXT=$(printf '%s\n' "$CONTEXT_INSTRUCTION" | sed 's/[&/\]/\\&/g')
         PROMPT=$(echo "$PROMPT" | sed "s/\${CONTEXT_INSTRUCTION}/$ESCAPED_CONTEXT/g")
-
-        # -----------------------------------------------------------------
-        # 4. Build the API request payload
-        # -----------------------------------------------------------------
         combined=$(printf '%s\n\nDiff:\n```diff\n%s\n```' "$PROMPT" "$DIFF_DATA")
-        json=$(jq -n --arg c "$combined" '{contents:[{parts:[{text:$c}]}], generationConfig:{temperature:0.1}}')
 
         # -----------------------------------------------------------------
-        # 5. Call Gemini API with automatic 503 retry and recovery loops
+        # 2. Helper: Call Gemini
         # -----------------------------------------------------------------
-        echo "Contacting Gemini API endpoints..."
-        if ! resp=$(curl -fsS \
-          --retry 3 \
-          --retry-delay 2 \
-          --retry-connrefused \
-          "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent" \
-          -H "x-goog-api-key: ${{ inputs.gemini_api_key }}" \
-          -H "Content-Type: application/json" \
-          -d "$json"); then
+        call_gemini() {
+          local model="$1"
+          local out_file="$2"
+          local status_file="$3"
           
-          echo "⚠️ Gemini API is temporarily unavailable (503). Running alternative response bridge."
-          echo "The Gemini API service is temporarily down or overloaded. Automated code checks skipped for this run update." > review.md
-          exit 0
+          local json
+          json=$(jq -n --arg c "$combined" '{contents:[{parts:[{text:$c}]}], generationConfig:{temperature:0.1}}')
+          
+          local response_file
+          response_file=$(mktemp)
+          local http_code
+          
+          http_code=$(curl -sS -w "%{http_code}" -o "$response_file" \
+            --retry 2 --retry-delay 2 \
+            -H "x-goog-api-key: $GEMINI_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$json" \
+            "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent")
+          
+          if [ "$http_code" -eq 200 ]; then
+            jq -r '.candidates[0].content.parts[0].text // "LGTM! No structural, security, or performance issues identified."' "$response_file" > "$out_file"
+            echo "SUCCESS" > "$status_file"
+            rm -f "$response_file"
+            return 0
+          else
+            if [ "$http_code" -eq 429 ]; then
+              echo "RATE_LIMIT" > "$status_file"
+            elif [ "$http_code" -eq 503 ] || [ "$http_code" -eq 500 ]; then
+              echo "SERVICE_UNAVAILABLE" > "$status_file"
+            else
+              echo "ERROR_$http_code" > "$status_file"
+            fi
+            rm -f "$response_file"
+            return 1
+          fi
+        }
+
+        # -----------------------------------------------------------------
+        # 3. Helper: Call DeepSeek
+        # -----------------------------------------------------------------
+        call_deepseek() {
+          local model="$1"
+          local out_file="$2"
+          
+          local json
+          json=$(jq -n --arg m "$model" --arg c "$combined" '{
+            model: $m,
+            messages: [{role: "user", content: $c}],
+            temperature: 0.1,
+            stream: false
+          }')
+          
+          local response_file
+          response_file=$(mktemp)
+          local http_code
+          
+          http_code=$(curl -sS -w "%{http_code}" -o "$response_file" \
+            --retry 2 --retry-delay 2 \
+            -H "Authorization: Bearer $DEEPSEEK_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$json" \
+            "https://api.deepseek.com/chat/completions")
+          
+          if [ "$http_code" -eq 200 ]; then
+            jq -r '.choices[0].message.content // "LGTM! No structural, security, or performance issues identified."' "$response_file" > "$out_file"
+            rm -f "$response_file"
+            return 0
+          else
+            rm -f "$response_file"
+            return 1
+          fi
+        }
+
+        # -----------------------------------------------------------------
+        # 4. Execute fallback chain
+        # -----------------------------------------------------------------
+        STATUS_SIGNAL=$(mktemp)
+        OUT_PAYLOAD=$(mktemp)
+
+        echo "🔄 Attempting primary model: $PRIMARY_MODEL"
+        # We temporarily disable 'set -e' layout via || true to handle error signaling safely
+        call_gemini "$PRIMARY_MODEL" "$OUT_PAYLOAD" "$STATUS_SIGNAL" && RC=$? || RC=$?
+
+        if [ "$RC" -ne 0 ]; then
+          SIGNAL=$(cat "$STATUS_SIGNAL")
+          if [ "$SIGNAL" = "RATE_LIMIT" ]; then
+            echo "⚠️ Rate limit hit on $PRIMARY_MODEL. Pausing 5s before fallback..."
+            sleep 5
+          fi
+          
+          echo "🔄 Attempting fallback Gemini: $FALLBACK_GEMINI_MODEL"
+          call_gemini "$FALLBACK_GEMINI_MODEL" "$OUT_PAYLOAD" "$STATUS_SIGNAL" && RC=$? || RC=$?
+          
+          if [ "$RC" -ne 0 ] && [ -n "$DEEPSEEK_KEY" ]; then
+            echo "🔄 Attempting DeepSeek: $DEEPSEEK_MODEL"
+            call_deepseek "$DEEPSEEK_MODEL" "$OUT_PAYLOAD" && RC=$? || RC=$?
+          fi
         fi
 
-        # -----------------------------------------------------------------
-        # 6. FIXED: Use printf to pipe raw string values safely without 
-        #    letting the shell echo collapse formatting down into literal "\n".
-        # -----------------------------------------------------------------
-        printf '%s' "$resp" | jq -r '.candidates[0].content.parts[0].text // "LGTM! No structural, security, or performance issues identified."' > review.md
+        # Check final fallback status state layout
+        if [ "$RC" -eq 0 ]; then
+          cat "$OUT_PAYLOAD" > review.md
+          echo "✅ Audit generation process finalized successfully."
+        else
+          echo "❌ All AI execution endpoints dropped or throttled responses."
+          echo "⚠️ Automated review engine systems are currently heavily throttled. Please proceed with standard human peer review checks." > review.md
+        fi
+
+        rm -f "$STATUS_SIGNAL" "$OUT_PAYLOAD"
 
     - name: Post Review Comment
       shell: bash
-      if: ${{ steps.diff.outputs.skip != 'true' }}
+      if: steps.diff.outputs.skip != 'true'
       env:
         GH_TOKEN: ${{ github.token }}
         PR: ${{ github.event.pull_request.number }}
-        SHA: ${{ github.event.pull_request.head.sha }}
       run: |
         set -euo pipefail
 
-        # Strip any accidental duplicate literal escape sequences left behind
         sed -i 's/\\n/\n/g' review.md
         sed -i -e '/./,$!d' review.md
 
-        # Build clean markdown document natively using real file appends
         printf '%s\n\n' '## 🛡️ Gemini Automated Audit' > comment.md
         cat review.md >> comment.md
 
-        # Post the clean text file straight to the pull request timeline
         gh pr comment "$PR" --body-file comment.md
