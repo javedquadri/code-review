@@ -1,5 +1,5 @@
-name: 'Gemini Central Review Engine'
-description: 'Centralized PR review using Gemini with DeepSeek fallback'
+name: 'Code Review'
+description: 'AI-powered PR review with Gemini and DeepSeek fallback'
 
 inputs:
   gemini_api_key:
@@ -263,7 +263,7 @@ runs:
         sed -i 's/\\n/\n/g' review.md
         sed -i -e '/./,$!d' review.md
 
-        printf '%s\n\n' '## 🛡️ Gemini Automated Audit' > comment.md
+        printf '%s\n\n' '## 🛡️ AI Automated Audit' > comment.md
         cat review.md >> comment.md
 
         gh pr comment "$PR" --body-file comment.md
