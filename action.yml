@@ -1,12 +1,12 @@
-name: 'Code Review'
-description: 'AI-powered PR review with Gemini and DeepSeek fallback'
+name: 'AI Code Review'
+description: 'Strict AI-powered PR review for quality, security, performance, and maintainability with Gemini primary and DeepSeek fallback'
 
 inputs:
   gemini_api_key:
     description: 'Gemini API Key from Google AI Studio'
     required: true
   deepseek_api_key:
-    description: 'DeepSeek API Key (fallback provider)'
+    description: 'DeepSeek API Key fallback provider'
     required: false
     default: ''
   model:
@@ -18,39 +18,100 @@ inputs:
     required: false
     default: 'gemini-2.5-flash'
   deepseek_model:
-    description: 'DeepSeek model to use as fallback'
+    description: 'DeepSeek model fallback'
     required: false
     default: 'deepseek-v4-flash'
   tech_stack:
-    description: 'Tech stack (e.g., "TypeScript/React"). Leave blank for AI detection.'
+    description: 'Tech stack hint. Leave blank for AI detection.'
     required: false
     default: ''
   max_changed_lines:
-    description: 'Max total lines before skipping review'
+    description: 'Maximum total changed lines before strict review fails or skips depending on fail_on_oversized_pr'
     required: false
     default: '3000'
   max_changed_files:
-    description: 'Max changed files before skipping review'
+    description: 'Maximum changed files before strict review fails or skips depending on fail_on_oversized_pr'
     required: false
     default: '60'
+  max_diff_bytes:
+    description: 'Maximum diff bytes sent to the model. Larger diffs are rejected by default.'
+    required: false
+    default: '200000'
+  fail_on:
+    description: 'When to fail the action: blocked, caution, never'
+    required: false
+    default: 'blocked'
+  fail_on_oversized_pr:
+    description: 'Fail instead of skipping when PR exceeds max_changed_lines/max_changed_files/max_diff_bytes'
+    required: false
+    default: 'true'
+  post_review_comment:
+    description: 'Post review comment to PR'
+    required: false
+    default: 'true'
+  include_agents_md:
+    description: 'Include AGENTS.md instructions in the review prompt when present'
+    required: false
+    default: 'true'
+  include_package_context:
+    description: 'Include package.json scripts/dependencies when present'
+    required: false
+    default: 'true'
+  require_valid_json:
+    description: 'Fail when model output cannot be parsed as expected JSON'
+    required: false
+    default: 'true'
+
+outputs:
+  verdict:
+    description: 'AI review verdict: SAFE, CAUTION, BLOCKED, SKIPPED, or ERROR'
+    value: ${{ steps.parse.outputs.verdict }}
+  blocking_count:
+    description: 'Number of blocking findings'
+    value: ${{ steps.parse.outputs.blocking_count }}
+  caution_count:
+    description: 'Number of caution findings'
+    value: ${{ steps.parse.outputs.caution_count }}
 
 runs:
-  using: "composite"
+  using: 'composite'
   steps:
-    - name: Evaluate Diff and Check PR Size
+    - name: Validate PR Event and Tools
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        if [ "${{ github.event_name }}" != "pull_request" ] && [ "${{ github.event_name }}" != "pull_request_target" ]; then
+          echo "This action is intended for pull_request or pull_request_target events only."
+          exit 1
+        fi
+
+        for tool in git jq curl gh sed awk perl; do
+          if ! command -v "$tool" >/dev/null 2>&1; then
+            echo "Required tool missing: $tool"
+            exit 1
+          fi
+        done
+
+    - name: Evaluate Diff and PR Size
       id: diff
       shell: bash
       run: |
         set -euo pipefail
-        
+
         BASE_SHA="${{ github.event.pull_request.base.sha }}"
         HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-        
-        git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA"
-        git diff "$BASE_SHA...$HEAD_SHA" > raw.patch
+
+        git fetch --no-tags --depth=200 origin "$BASE_SHA" "$HEAD_SHA"
+        git diff --no-ext-diff --unified=80 "$BASE_SHA...$HEAD_SHA" > raw.patch
+        git diff --name-only "$BASE_SHA...$HEAD_SHA" > changed_files.txt
+        git diff --name-status "$BASE_SHA...$HEAD_SHA" > changed_files_status.txt
+        git diff --stat "$BASE_SHA...$HEAD_SHA" > diff_stat.txt
 
         if [ ! -s raw.patch ]; then
           echo "skip=true" >> "$GITHUB_OUTPUT"
+          echo "verdict=SKIPPED" >> "$GITHUB_OUTPUT"
+          echo "reason=No diff to review" >> "$GITHUB_OUTPUT"
           exit 0
         fi
 
@@ -60,21 +121,203 @@ runs:
         TOTAL=$((ADDITIONS + DELETIONS))
         MAX_LINES=${{ inputs.max_changed_lines }}
         MAX_FILES=${{ inputs.max_changed_files }}
+        MAX_DIFF_BYTES=${{ inputs.max_diff_bytes }}
+        DIFF_BYTES=$(wc -c < raw.patch | tr -d ' ')
 
-        if [ "$TOTAL" -gt "$MAX_LINES" ] || [ "$FILES" -gt "$MAX_FILES" ]; then
+        {
+          echo "additions=$ADDITIONS"
+          echo "deletions=$DELETIONS"
+          echo "total_changed_lines=$TOTAL"
+          echo "changed_files=$FILES"
+          echo "diff_bytes=$DIFF_BYTES"
+        } >> "$GITHUB_OUTPUT"
+
+        oversized_reason=""
+        if [ "$TOTAL" -gt "$MAX_LINES" ]; then
+          oversized_reason="${oversized_reason}changed lines ${TOTAL} > ${MAX_LINES}; "
+        fi
+        if [ "$FILES" -gt "$MAX_FILES" ]; then
+          oversized_reason="${oversized_reason}changed files ${FILES} > ${MAX_FILES}; "
+        fi
+        if [ "$DIFF_BYTES" -gt "$MAX_DIFF_BYTES" ]; then
+          oversized_reason="${oversized_reason}diff bytes ${DIFF_BYTES} > ${MAX_DIFF_BYTES}; "
+        fi
+
+        if [ -n "$oversized_reason" ]; then
           echo "skip=true" >> "$GITHUB_OUTPUT"
-          echo "⚠️ Skipped: PR has ${TOTAL} lines / ${FILES} files (limits: ${MAX_LINES} lines / ${MAX_FILES} files)." 
+          echo "verdict=BLOCKED" >> "$GITHUB_OUTPUT"
+          echo "reason=$oversized_reason" >> "$GITHUB_OUTPUT"
+          {
+            echo "## 🛡️ AI Automated Audit"
+            echo
+            echo "🚨 **Blocked: PR is too large for reliable AI review.**"
+            echo
+            echo "Reason: $oversized_reason"
+            echo
+            echo "Split this PR into smaller focused changes or raise the review limits intentionally."
+          } > review.md
+
+          if [ "${{ inputs.fail_on_oversized_pr }}" = "true" ]; then
+            echo "oversized_fail=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "oversized_fail=false" >> "$GITHUB_OUTPUT"
+          fi
           exit 0
         fi
-        
+
         echo "skip=false" >> "$GITHUB_OUTPUT"
+
+    - name: Build Strict Review Prompt
+      id: prompt
+      if: steps.diff.outputs.skip != 'true'
+      shell: bash
+      env:
+        TECH_STACK: ${{ inputs.tech_stack }}
+        INCLUDE_AGENTS_MD: ${{ inputs.include_agents_md }}
+        INCLUDE_PACKAGE_CONTEXT: ${{ inputs.include_package_context }}
+      run: |
+        set -euo pipefail
+
+        PROMPT_FILE=$(mktemp)
+        echo "prompt_file=$PROMPT_FILE" >> "$GITHUB_OUTPUT"
+
+        {
+          printf '%s\n' 'You are a senior staff-level pull request reviewer, similar in strictness to Gemini Code Assist, focused on production-grade code quality.'
+          printf '\n'
+          printf '%s\n' 'You are reviewing ONLY the provided PR diff plus limited repository context. Do not invent files or behavior that are not visible in the diff/context. Be strict, but avoid noisy nitpicks.'
+          printf '\n'
+          printf '%s\n' 'Primary objective:'
+          printf '%s\n' 'Find issues that could block or degrade production readiness, including correctness, security, performance, reliability, maintainability, testability, and architecture.'
+          printf '\n'
+          printf '%s\n' 'Severity policy:'
+          printf '%s\n' '- BLOCKING: Must be fixed before merge. Includes security vulnerabilities, auth/authorization bugs, data loss/corruption, runtime crashes, broken invariants, failing type/build/lint assumptions, unsafe secrets/logging, injection, race conditions, serious performance regressions, missing validation on trust boundaries, or changes that violate AGENTS.md rules.'
+          printf '%s\n' '- CAUTION: Should be fixed soon or before merge if low risk. Includes maintainability, complexity, test gaps, edge cases, moderate performance risks, unclear API boundaries, duplication, or fragile abstractions.'
+          printf '%s\n' '- INFO: Non-blocking observations only. Avoid style-only comments.'
+          printf '\n'
+          printf '%s\n' 'Security checklist:'
+          printf '%s\n' '- Injection risks: SQL/NoSQL/command/template/XSS/SSRF/path traversal'
+          printf '%s\n' '- Broken auth/session/authorization/access-control logic'
+          printf '%s\n' '- Secrets exposure in code, logs, errors, telemetry, client bundles, or diffs'
+          printf '%s\n' '- Unsafe CORS, cookies, CSRF, redirects, file uploads, deserialization'
+          printf '%s\n' '- Missing validation/sanitization at API boundaries'
+          printf '%s\n' '- Dependency or supply-chain risk visible in the diff'
+          printf '\n'
+          printf '%s\n' 'Performance checklist:'
+          printf '%s\n' '- N+1 queries, unnecessary network calls, missing indexes, excessive DB roundtrips'
+          printf '%s\n' '- Blocking I/O or sequential await patterns that should be parallelized'
+          printf '%s\n' '- Expensive render loops, avoidable React rerenders, unstable dependencies'
+          printf '%s\n' '- Memory leaks, unbounded caches, large payloads, inefficient algorithms'
+          printf '%s\n' '- Cloudflare Worker limits, cold start, CPU time, D1/query inefficiency when relevant'
+          printf '\n'
+          printf '%s\n' 'TypeScript/React checklist:'
+          printf '%s\n' '- Preserve strict type safety. Avoid `any`, unsafe casts, non-null assertions, weak generics, leaky types'
+          printf '%s\n' '- Validate runtime data with schemas where appropriate'
+          printf '%s\n' '- Correct React hook usage, dependency arrays, state ownership, controlled/uncontrolled inputs'
+          printf '%s\n' '- Accessibility regressions for UI changes'
+          printf '%s\n' '- Server/client boundary mistakes'
+          printf '\n'
+          printf '%s\n' 'Testing checklist:'
+          printf '%s\n' '- If behavior changed, identify missing or weak tests'
+          printf '%s\n' '- Verify invariants and regression-sensitive paths'
+          printf '%s\n' '- Do not request tests for obvious docs-only changes'
+          printf '\n'
+          printf '%s\n' 'Review style:'
+          printf '%s\n' '- Be direct and actionable.'
+          printf '%s\n' '- Reference files/functions when possible.'
+          printf '%s\n' '- Include suggested fixes, not just complaints.'
+          printf '%s\n' '- Do not comment on formatting, indentation, semicolons, or purely subjective style.'
+          printf '%s\n' '- Do not repeat the same issue multiple times.'
+          printf '%s\n' '- If there are no material issues, return SAFE.'
+          printf '\n'
+          printf '%s\n' 'Required output:'
+          printf '%s\n' 'Return ONLY valid JSON. Do not wrap in markdown. No prose outside JSON.'
+          printf '\n'
+          printf '%s\n' 'Schema:'
+          printf '%s\n' '{'
+          printf '%s\n' '  "verdict": "SAFE" | "CAUTION" | "BLOCKED",'
+          printf '%s\n' '  "summary": "one short paragraph",'
+          printf '%s\n' '  "blocking": ['
+          printf '%s\n' '    {'
+          printf '%s\n' '      "title": "short issue title",'
+          printf '%s\n' '      "file": "path or unknown",'
+          printf '%s\n' '      "risk": "why this matters",'
+          printf '%s\n' '      "suggested_fix": "specific fix"'
+          printf '%s\n' '    }'
+          printf '%s\n' '  ],'
+          printf '%s\n' '  "caution": ['
+          printf '%s\n' '    {'
+          printf '%s\n' '      "title": "short issue title",'
+          printf '%s\n' '      "file": "path or unknown",'
+          printf '%s\n' '      "risk": "why this matters",'
+          printf '%s\n' '      "suggested_fix": "specific fix"'
+          printf '%s\n' '    }'
+          printf '%s\n' '  ],'
+          printf '%s\n' '  "info": ['
+          printf '%s\n' '    {'
+          printf '%s\n' '      "title": "short note",'
+          printf '%s\n' '      "file": "path or unknown",'
+          printf '%s\n' '      "note": "short note"'
+          printf '%s\n' '    }'
+          printf '%s\n' '  ],'
+          printf '%s\n' '  "positive_notes": ["short positive observation, optional"],'
+          printf '%s\n' '  "recommended_tests": ["specific test recommendation, optional"]'
+          printf '%s\n' '}'
+          printf '\n'
+          printf '%s\n' 'Rules:'
+          printf '%s\n' '- verdict MUST be BLOCKED if blocking has one or more items.'
+          printf '%s\n' '- verdict MUST be CAUTION if blocking is empty and caution has one or more items.'
+          printf '%s\n' '- verdict MUST be SAFE only if blocking and caution are empty.'
+        } > "$PROMPT_FILE"
+
+        {
+          echo
+          echo "Repository context:"
+          echo "Tech stack hint: ${TECH_STACK:-auto-detect from diff}"
+          echo
+          echo "Changed files:"
+          sed 's/^/- /' changed_files.txt
+          echo
+          echo "Diff stat:"
+          cat diff_stat.txt
+        } >> "$PROMPT_FILE"
+
+        if [ "$INCLUDE_AGENTS_MD" = "true" ] && [ -f AGENTS.md ]; then
+          {
+            echo
+            echo "AGENTS.md repository instructions:"
+            echo '```md'
+            head -c 20000 AGENTS.md
+            echo
+            echo '```'
+          } >> "$PROMPT_FILE"
+        fi
+
+        if [ "$INCLUDE_PACKAGE_CONTEXT" = "true" ] && [ -f package.json ]; then
+          {
+            echo
+            echo "Root package.json context:"
+            echo '```json'
+            jq '{scripts, dependencies, devDependencies, packageManager, workspaces}' package.json 2>/dev/null || cat package.json
+            echo
+            echo '```'
+          } >> "$PROMPT_FILE"
+        fi
+
+        {
+          echo
+          echo "PR diff:"
+          echo '```diff'
+          cat raw.patch
+          echo
+          echo '```'
+        } >> "$PROMPT_FILE"
 
     - name: AI Review with Gemini + DeepSeek Fallback
       id: review
       if: steps.diff.outputs.skip != 'true'
       shell: bash
       env:
-        TECH_STACK: ${{ inputs.tech_stack }}
+        PROMPT_FILE: ${{ steps.prompt.outputs.prompt_file }}
         PRIMARY_MODEL: ${{ inputs.model }}
         FALLBACK_GEMINI_MODEL: ${{ inputs.fallback_gemini_model }}
         DEEPSEEK_MODEL: ${{ inputs.deepseek_model }}
@@ -83,241 +326,325 @@ runs:
       run: |
         set -euo pipefail
 
-        # -----------------------------------------------------------------
-        # 1. Truncate oversized diffs to avoid argument/request limits
-        # -----------------------------------------------------------------
-        MAX_DIFF=200000
-        if [ -f raw.patch ]; then
-          size=$(wc -c < raw.patch)
-          if [ "$size" -gt "$MAX_DIFF" ]; then
-            echo "⚠️ Diff too large (${size} bytes). Truncating to ${MAX_DIFF} bytes."
-            head -c "$MAX_DIFF" raw.patch > raw.truncated.patch
-            printf '\n\n--- PATCH TRUNCATED: original was %s bytes. Review may be incomplete. ---\n\n' "$size" >> raw.truncated.patch
-            mv raw.truncated.patch raw.patch
-          fi
-        fi
-
-        # -----------------------------------------------------------------
-        # 2. Build the prompt into a temp file (no large shell vars)
-        # -----------------------------------------------------------------
-        COMBINED_FILE=$(mktemp)
-        
-        if [ -z "$TECH_STACK" ]; then
-          cat > "$COMBINED_FILE" << 'CONTEXTEOF'
-        You are reviewing a Pull Request for an **unspecified codebase**.
-        **Do not assume any specific framework.**
-        Analyze the `git diff` to identify the primary language(s) and frameworks being used.
-        Focus on generic, universal principles: security vulnerabilities (OWASP Top 10),
-        performance bottlenecks (N+1 queries, O(n^2) loops), and maintainability (DRY, SOLID).
-
-        You are viewing only the `git diff`. Focus on **cascading impact**.
-        Do NOT comment on formatting, indentation, or missing semicolons.
-
-        **Analysis Tiers:**
-        1. **🔴 Critical (Blocking Merge):**
-           - Security vulnerabilities (SQLi, XSS, exposed secrets).
-           - Data corruption/loss risks (bad transaction boundaries).
-           - Unhandled exceptions that crash the runtime.
-
-        2. **🟡 Performance & Scalability:**
-           - N+1 queries, missing indexes.
-           - Blocking I/O in async loops, memory leaks.
-           - Inefficient algorithms (O(n²)).
-
-        3. **🔵 Maintainability & Architecture:**
-           - SRP violations (functions > 200 lines).
-           - Debugging leftovers: `console.log`, `debugger`, `pdb`.
-
-        **OUTPUT RULES:**
-        - Start directly with the Analysis Tiers or Risk Score.
-        - If a Tier has no issues, omit it.
-        - **MUST end with a Risk Score:** `✅ Safe to Merge`, `⚠️ Proceed with Caution`, or `🚨 Blocked`.
-
-        **Final Rule:** If nothing is found, reply exactly:
-        > LGTM! No structural, security, or performance issues identified.
-        CONTEXTEOF
-        else
-          cat > "$COMBINED_FILE" << PROMPTEOF
-        You are reviewing a Pull Request for a codebase written in: **${TECH_STACK}**.
-
-        You are viewing only the \`git diff\`. Focus on **cascading impact**.
-        Do NOT comment on formatting, indentation, or missing semicolons.
-
-        **Analysis Tiers:**
-        1. **🔴 Critical (Blocking Merge):**
-           - Security vulnerabilities (SQLi, XSS, exposed secrets).
-           - Data corruption/loss risks (bad transaction boundaries).
-           - Unhandled exceptions that crash the runtime.
-
-        2. **🟡 Performance & Scalability:**
-           - N+1 queries, missing indexes.
-           - Blocking I/O in async loops, memory leaks.
-           - Inefficient algorithms (O(n²)).
-
-        3. **🔵 Maintainability & Architecture:**
-           - SRP violations (functions > 200 lines).
-           - Debugging leftovers: \`console.log\`, \`debugger\`, \`pdb\`.
-
-        **OUTPUT RULES:**
-        - Start directly with the Analysis Tiers or Risk Score.
-        - If a Tier has no issues, omit it.
-        - **MUST end with a Risk Score:** \`✅ Safe to Merge\`, \`⚠️ Proceed with Caution\`, or \`🚨 Blocked\`.
-
-        **Final Rule:** If nothing is found, reply exactly:
-        > LGTM! No structural, security, or performance issues identified.
-        PROMPTEOF
-        fi
-
-        printf '\n\nDiff:\n```diff\n' >> "$COMBINED_FILE"
-        cat raw.patch >> "$COMBINED_FILE"
-        printf '\n```' >> "$COMBINED_FILE"
-
-        # -----------------------------------------------------------------
-        # 3. Helper: Call Gemini (file-based, no large args)
-        # -----------------------------------------------------------------
         call_gemini() {
           local model="$1"
           local out_file="$2"
           local status_file="$3"
-          
-          local json_file
+          local json_file response_file http_code error_summary
+
           json_file=$(mktemp)
-          jq -n --rawfile c "$COMBINED_FILE" '{contents:[{parts:[{text:$c}]}], generationConfig:{temperature:0.1}}' > "$json_file"
-          
-          local response_file
           response_file=$(mktemp)
-          local http_code
-          local error_summary
-          
+
+          jq -n --rawfile c "$PROMPT_FILE" '{
+            contents: [{parts: [{text: $c}]}],
+            generationConfig: {
+              temperature: 0.05,
+              topP: 0.9,
+              responseMimeType: "application/json"
+            }
+          }' > "$json_file"
+
           http_code=$(curl -sS -w "%{http_code}" -o "$response_file" \
-            --retry 2 --retry-delay 2 \
+            --retry 3 --retry-delay 2 --retry-all-errors \
             -H "x-goog-api-key: $GEMINI_KEY" \
             -H "Content-Type: application/json" \
             -d @"$json_file" \
             "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent")
-          
-          if [ "$http_code" -eq 200 ]; then
-            jq -r '.candidates[0].content.parts[0].text // "LGTM! No structural, security, or performance issues identified."' "$response_file" > "$out_file"
-            echo "SUCCESS" > "$status_file"
-            rm -f "$response_file" "$json_file"
-            return 0
-          else
-            error_summary=$(jq -c '{
-              error: (.error.message // .error.status // .error.code // "unknown"),
-              details: (.error.details // empty)
-            }' "$response_file" 2>/dev/null || true)
-            if [ -z "$error_summary" ]; then
-              error_summary=$(tr '\n' ' ' < "$response_file" | cut -c1-400)
-            fi
 
-            if [ "$http_code" -eq 429 ]; then
-              echo "RATE_LIMIT" > "$status_file"
-            elif [ "$http_code" -eq 503 ] || [ "$http_code" -eq 500 ]; then
-              echo "SERVICE_UNAVAILABLE" > "$status_file"
-            else
-              echo "ERROR_$http_code" > "$status_file"
+          if [ "$http_code" -eq 200 ]; then
+            jq -r '.candidates[0].content.parts[0].text // empty' "$response_file" > "$out_file"
+            if [ ! -s "$out_file" ]; then
+              echo "EMPTY_RESPONSE" > "$status_file"
+              rm -f "$json_file" "$response_file"
+              return 1
             fi
-            echo "Gemini request failed for model=$model http_code=$http_code status=$(cat "$status_file") response=$error_summary"
-            rm -f "$response_file" "$json_file"
-            return 1
+            echo "SUCCESS" > "$status_file"
+            rm -f "$json_file" "$response_file"
+            return 0
           fi
+
+          error_summary=$(jq -c '{error: (.error.message // .error.status // .error.code // "unknown")}' "$response_file" 2>/dev/null || true)
+          [ -n "$error_summary" ] || error_summary=$(tr '\n' ' ' < "$response_file" | cut -c1-400)
+
+          case "$http_code" in
+            429) echo "RATE_LIMIT" > "$status_file" ;;
+            500|502|503|504) echo "SERVICE_UNAVAILABLE" > "$status_file" ;;
+            *) echo "ERROR_$http_code" > "$status_file" ;;
+          esac
+
+          echo "Gemini request failed model=$model http_code=$http_code status=$(cat "$status_file") response=$error_summary"
+          rm -f "$json_file" "$response_file"
+          return 1
         }
 
-        # -----------------------------------------------------------------
-        # 4. Helper: Call DeepSeek (file-based, no large args)
-        # -----------------------------------------------------------------
         call_deepseek() {
           local model="$1"
           local out_file="$2"
-          
-          local json_file
+          local json_file response_file http_code error_summary
+
+          if [ -z "$DEEPSEEK_KEY" ]; then
+            echo "DeepSeek key not configured."
+            return 1
+          fi
+
           json_file=$(mktemp)
-          jq -n --arg m "$model" --rawfile c "$COMBINED_FILE" '{
+          response_file=$(mktemp)
+
+          jq -n --arg m "$model" --rawfile c "$PROMPT_FILE" '{
             model: $m,
-            messages: [{role: "user", content: $c}],
-            temperature: 0.1,
+            messages: [
+              {role: "system", content: "Return only valid JSON matching the requested schema."},
+              {role: "user", content: $c}
+            ],
+            temperature: 0.05,
             stream: false
           }' > "$json_file"
-          
-          local response_file
-          response_file=$(mktemp)
-          local http_code
-          local error_summary
-          
+
           http_code=$(curl -sS -w "%{http_code}" -o "$response_file" \
-            --retry 2 --retry-delay 2 \
+            --retry 3 --retry-delay 2 --retry-all-errors \
             -H "Authorization: Bearer $DEEPSEEK_KEY" \
             -H "Content-Type: application/json" \
             -d @"$json_file" \
             "https://api.deepseek.com/chat/completions")
-          
+
           if [ "$http_code" -eq 200 ]; then
-            jq -r '.choices[0].message.content // "LGTM! No structural, security, or performance issues identified."' "$response_file" > "$out_file"
-            rm -f "$response_file" "$json_file"
-            return 0
-          else
-            error_summary=$(jq -c '{
-              error: (.error.message // .error.type // .error.code // "unknown")
-            }' "$response_file" 2>/dev/null || true)
-            if [ -z "$error_summary" ]; then
-              error_summary=$(tr '\n' ' ' < "$response_file" | cut -c1-400)
+            jq -r '.choices[0].message.content // empty' "$response_file" > "$out_file"
+            if [ ! -s "$out_file" ]; then
+              rm -f "$json_file" "$response_file"
+              return 1
             fi
-            echo "DeepSeek request failed for model=$model http_code=$http_code response=$error_summary"
-            rm -f "$response_file" "$json_file"
-            return 1
+            rm -f "$json_file" "$response_file"
+            return 0
           fi
+
+          error_summary=$(jq -c '{error: (.error.message // .error.type // .error.code // "unknown")}' "$response_file" 2>/dev/null || true)
+          [ -n "$error_summary" ] || error_summary=$(tr '\n' ' ' < "$response_file" | cut -c1-400)
+          echo "DeepSeek request failed model=$model http_code=$http_code response=$error_summary"
+          rm -f "$json_file" "$response_file"
+          return 1
         }
 
-        # -----------------------------------------------------------------
-        # 5. Execute fallback chain
-        # -----------------------------------------------------------------
         STATUS_SIGNAL=$(mktemp)
         OUT_PAYLOAD=$(mktemp)
+        RC=1
 
-        echo "🔄 Attempting primary model: $PRIMARY_MODEL"
-        # We temporarily disable 'set -e' layout via || true to handle error signaling safely
-        call_gemini "$PRIMARY_MODEL" "$OUT_PAYLOAD" "$STATUS_SIGNAL" && RC=$? || RC=$?
+        echo "Attempting primary Gemini model: $PRIMARY_MODEL"
+        call_gemini "$PRIMARY_MODEL" "$OUT_PAYLOAD" "$STATUS_SIGNAL" && RC=0 || RC=$?
 
         if [ "$RC" -ne 0 ]; then
-          SIGNAL=$(cat "$STATUS_SIGNAL")
+          SIGNAL=$(cat "$STATUS_SIGNAL" 2>/dev/null || echo UNKNOWN)
           if [ "$SIGNAL" = "RATE_LIMIT" ]; then
-            echo "⚠️ Rate limit hit on $PRIMARY_MODEL. Pausing 5s before fallback..."
             sleep 5
           fi
-          
-          echo "🔄 Attempting fallback Gemini: $FALLBACK_GEMINI_MODEL"
-          call_gemini "$FALLBACK_GEMINI_MODEL" "$OUT_PAYLOAD" "$STATUS_SIGNAL" && RC=$? || RC=$?
-          
-          if [ "$RC" -ne 0 ] && [ -n "$DEEPSEEK_KEY" ]; then
-            echo "🔄 Attempting DeepSeek: $DEEPSEEK_MODEL"
-            call_deepseek "$DEEPSEEK_MODEL" "$OUT_PAYLOAD" && RC=$? || RC=$?
+
+          echo "Attempting fallback Gemini model: $FALLBACK_GEMINI_MODEL"
+          call_gemini "$FALLBACK_GEMINI_MODEL" "$OUT_PAYLOAD" "$STATUS_SIGNAL" && RC=0 || RC=$?
+        fi
+
+        if [ "$RC" -ne 0 ] && [ -n "$DEEPSEEK_KEY" ]; then
+          echo "Attempting DeepSeek fallback model: $DEEPSEEK_MODEL"
+          call_deepseek "$DEEPSEEK_MODEL" "$OUT_PAYLOAD" && RC=0 || RC=$?
+        fi
+
+        if [ "$RC" -eq 0 ]; then
+          perl -0777 -pe 's/^```(?:json)?\s*//; s/\s*```$//' "$OUT_PAYLOAD" > review.json
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+        else
+          jq -n '{
+            verdict: "ERROR",
+            summary: "All AI review providers failed or were throttled. Manual review is required.",
+            blocking: [
+              {
+                title: "AI review unavailable",
+                file: "unknown",
+                risk: "The automated strict review did not complete, so this PR has not passed the required AI quality gate.",
+                suggested_fix: "Retry the workflow or perform and document a manual senior review."
+              }
+            ],
+            caution: [],
+            info: [],
+            positive_notes: [],
+            recommended_tests: []
+          }' > review.json
+          echo "ok=false" >> "$GITHUB_OUTPUT"
+        fi
+
+        rm -f "$STATUS_SIGNAL" "$OUT_PAYLOAD"
+
+    - name: Parse Review Verdict
+      id: parse
+      if: steps.diff.outputs.skip != 'true'
+      shell: bash
+      env:
+        REQUIRE_VALID_JSON: ${{ inputs.require_valid_json }}
+      run: |
+        set -euo pipefail
+
+        if ! jq empty review.json >/dev/null 2>&1; then
+          echo "Model did not return valid JSON."
+          if [ "$REQUIRE_VALID_JSON" = "true" ]; then
+            jq -n '{
+              verdict: "BLOCKED",
+              summary: "AI review response was not valid JSON, so the strict review gate cannot be trusted.",
+              blocking: [
+                {
+                  title: "Invalid AI review output",
+                  file: "unknown",
+                  risk: "The review output could not be parsed, so required issues may have been missed.",
+                  suggested_fix: "Retry the workflow. If repeated, inspect the raw model output and adjust prompt/model limits."
+                }
+              ],
+              caution: [],
+              info: [],
+              positive_notes: [],
+              recommended_tests: []
+            }' > review.json
+          else
+            jq -n '{
+              verdict: "CAUTION",
+              summary: "AI review returned invalid JSON.",
+              blocking: [],
+              caution: [
+                {
+                  title: "Invalid AI review output",
+                  file: "unknown",
+                  risk: "Review could not be parsed reliably.",
+                  suggested_fix: "Retry workflow or review manually."
+                }
+              ],
+              info: [],
+              positive_notes: [],
+              recommended_tests: []
+            }' > review.json
           fi
         fi
 
-        # Check final fallback status state layout
-        if [ "$RC" -eq 0 ]; then
-          cat "$OUT_PAYLOAD" > review.md
-          echo "✅ Audit generation process finalized successfully."
-        else
-          echo "❌ All AI execution endpoints dropped or throttled responses."
-          echo "⚠️ Automated review engine systems are currently heavily throttled. Please proceed with standard human peer review checks." > review.md
+        verdict=$(jq -r '.verdict // "BLOCKED"' review.json)
+        blocking_count=$(jq '.blocking | length' review.json)
+        caution_count=$(jq '.caution | length' review.json)
+
+        if [ "$blocking_count" -gt 0 ]; then
+          verdict="BLOCKED"
+        elif [ "$caution_count" -gt 0 ] && [ "$verdict" = "SAFE" ]; then
+          verdict="CAUTION"
         fi
 
-        rm -f "$STATUS_SIGNAL" "$OUT_PAYLOAD" "$COMBINED_FILE"
+        echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+        echo "blocking_count=$blocking_count" >> "$GITHUB_OUTPUT"
+        echo "caution_count=$caution_count" >> "$GITHUB_OUTPUT"
+
+    - name: Render Review Comment
+      if: steps.diff.outputs.skip != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        verdict=$(jq -r '.verdict' review.json)
+        summary=$(jq -r '.summary // "No summary provided."' review.json)
+        blocking_count=$(jq '.blocking | length' review.json)
+        caution_count=$(jq '.caution | length' review.json)
+        info_count=$(jq '.info | length' review.json)
+
+        {
+          echo "## 🛡️ Strict AI Code Review"
+          echo
+          echo "**Verdict:** $verdict"
+          echo "**Blocking:** $blocking_count | **Caution:** $caution_count | **Info:** $info_count"
+          echo
+          echo "$summary"
+          echo
+
+          if [ "$blocking_count" -gt 0 ]; then
+            echo "### 🚨 Blocking Issues"
+            jq -r '.blocking[] | "#### " + .title + "\n- **File:** " + (.file // "unknown") + "\n- **Risk:** " + (.risk // "") + "\n- **Suggested fix:** " + (.suggested_fix // "") + "\n"' review.json
+          fi
+
+          if [ "$caution_count" -gt 0 ]; then
+            echo "### ⚠️ Caution Issues"
+            jq -r '.caution[] | "#### " + .title + "\n- **File:** " + (.file // "unknown") + "\n- **Risk:** " + (.risk // "") + "\n- **Suggested fix:** " + (.suggested_fix // "") + "\n"' review.json
+          fi
+
+          if [ "$info_count" -gt 0 ]; then
+            echo "### ℹ️ Notes"
+            jq -r '.info[] | "- **" + .title + "** (`" + (.file // "unknown") + "`): " + (.note // "")' review.json
+            echo
+          fi
+
+          tests_count=$(jq '.recommended_tests | length' review.json)
+          if [ "$tests_count" -gt 0 ]; then
+            echo "### 🧪 Recommended Tests"
+            jq -r '.recommended_tests[] | "- " + .' review.json
+            echo
+          fi
+
+          echo "---"
+          echo
+          echo "Review scope: staged PR diff from base to head. Large subjective style-only comments are intentionally excluded."
+        } > review.md
 
     - name: Post Review Comment
+      if: steps.diff.outputs.skip != 'true' && inputs.post_review_comment == 'true'
       shell: bash
-      if: steps.diff.outputs.skip != 'true'
       env:
         GH_TOKEN: ${{ github.token }}
         PR: ${{ github.event.pull_request.number }}
       run: |
         set -euo pipefail
+        gh pr comment "$PR" --body-file review.md
 
-        perl -i -pe 's/\\n/\n/g' review.md
-        sed -i -e '/./,$!d' review.md
+    - name: Post Oversized Review Comment
+      if: steps.diff.outputs.skip == 'true' && inputs.post_review_comment == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PR: ${{ github.event.pull_request.number }}
+      run: |
+        set -euo pipefail
+        if [ -f review.md ]; then
+          gh pr comment "$PR" --body-file review.md
+        fi
 
-        printf '## 🛡️ AI Automated Audit\n\n' > comment.md
-        cat review.md >> comment.md
+    - name: Enforce Strict Review Gate
+      if: always()
+      shell: bash
+      env:
+        FAIL_ON: ${{ inputs.fail_on }}
+      run: |
+        set -euo pipefail
 
-        gh pr comment "$PR" --body-file comment.md
+        if [ "${{ steps.diff.outputs.skip }}" = "true" ]; then
+          if [ "${{ steps.diff.outputs.oversized_fail }}" = "true" ]; then
+            echo "Failing because PR is oversized for reliable strict AI review."
+            exit 1
+          fi
+          echo "Review skipped: ${{ steps.diff.outputs.reason }}"
+          exit 0
+        fi
+
+        verdict="${{ steps.parse.outputs.verdict }}"
+        blocking_count="${{ steps.parse.outputs.blocking_count }}"
+        caution_count="${{ steps.parse.outputs.caution_count }}"
+
+        case "$FAIL_ON" in
+          blocked)
+            if [ "$verdict" = "BLOCKED" ] || [ "${blocking_count:-0}" -gt 0 ]; then
+              echo "Strict AI review failed: BLOCKED with ${blocking_count} blocking issue(s)."
+              exit 1
+            fi
+            ;;
+          caution)
+            if [ "$verdict" = "BLOCKED" ] || [ "$verdict" = "CAUTION" ] || [ "${blocking_count:-0}" -gt 0 ] || [ "${caution_count:-0}" -gt 0 ]; then
+              echo "Strict AI review failed: verdict=$verdict blocking=${blocking_count} caution=${caution_count}."
+              exit 1
+            fi
+            ;;
+          never)
+            echo "Strict AI review completed but failure enforcement disabled."
+            ;;
+          *)
+            echo "Invalid fail_on value: $FAIL_ON. Use blocked, caution, or never."
+            exit 1
+            ;;
+        esac
+
+        echo "Strict AI review passed: verdict=$verdict."
