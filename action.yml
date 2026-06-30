@@ -1,5 +1,5 @@
 name: 'AI Code Review'
-description: 'Strict AI-powered PR review for quality, security, performance, and maintainability with Gemini primary and DeepSeek fallback'
+description: 'Token-optimized AI PR review with targeted Gemini/DeepSeek reviewers and strict blocking verdicts'
 
 inputs:
   gemini_api_key:
@@ -18,82 +18,38 @@ inputs:
     required: false
     default: 'gemini-2.5-flash'
   deepseek_model:
-    description: 'DeepSeek model fallback'
+    description: 'DeepSeek fallback model'
     required: false
     default: 'deepseek-v4-flash'
   tech_stack:
-    description: 'Tech stack hint. Leave blank for AI detection.'
+    description: 'Tech stack summary. Leave blank for auto-detection from files.'
     required: false
     default: ''
   max_changed_lines:
-    description: 'Maximum total changed lines before strict review fails or skips depending on fail_on_oversized_pr'
+    description: 'Max total changed lines before failing the AI review gate'
     required: false
     default: '3000'
   max_changed_files:
-    description: 'Maximum changed files before strict review fails or skips depending on fail_on_oversized_pr'
+    description: 'Max changed files before failing the AI review gate'
     required: false
     default: '60'
-  max_diff_bytes:
-    description: 'Maximum diff bytes sent to the model. Larger diffs are rejected by default.'
+  max_patch_bytes_per_reviewer:
+    description: 'Max patch bytes sent to each targeted reviewer'
     required: false
-    default: '200000'
-  fail_on:
-    description: 'When to fail the action: blocked, caution, never'
+    default: '120000'
+  fail_on_caution:
+    description: 'Fail the action on CAUTION verdicts as well as BLOCKED'
     required: false
-    default: 'blocked'
-  fail_on_oversized_pr:
-    description: 'Fail instead of skipping when PR exceeds max_changed_lines/max_changed_files/max_diff_bytes'
-    required: false
-    default: 'true'
-  post_review_comment:
-    description: 'Post review comment to PR'
+    default: 'false'
+  post_comment:
+    description: 'Post AI review as a PR comment'
     required: false
     default: 'true'
-  include_agents_md:
-    description: 'Include AGENTS.md instructions in the review prompt when present'
-    required: false
-    default: 'true'
-  include_package_context:
-    description: 'Include package.json scripts/dependencies when present'
-    required: false
-    default: 'true'
-  require_valid_json:
-    description: 'Fail when model output cannot be parsed as expected JSON'
-    required: false
-    default: 'true'
-
-outputs:
-  verdict:
-    description: 'AI review verdict: SAFE, CAUTION, BLOCKED, SKIPPED, or ERROR'
-    value: ${{ steps.parse.outputs.verdict }}
-  blocking_count:
-    description: 'Number of blocking findings'
-    value: ${{ steps.parse.outputs.blocking_count }}
-  caution_count:
-    description: 'Number of caution findings'
-    value: ${{ steps.parse.outputs.caution_count }}
 
 runs:
   using: 'composite'
   steps:
-    - name: Validate PR Event and Tools
-      shell: bash
-      run: |
-        set -euo pipefail
-
-        if [ "${{ github.event_name }}" != "pull_request" ] && [ "${{ github.event_name }}" != "pull_request_target" ]; then
-          echo "This action is intended for pull_request or pull_request_target events only."
-          exit 1
-        fi
-
-        for tool in git jq curl gh sed awk perl; do
-          if ! command -v "$tool" >/dev/null 2>&1; then
-            echo "Required tool missing: $tool"
-            exit 1
-          fi
-        done
-
-    - name: Evaluate Diff and PR Size
+    - name: Prepare targeted diff context
       id: diff
       shell: bash
       run: |
@@ -102,16 +58,15 @@ runs:
         BASE_SHA="${{ github.event.pull_request.base.sha }}"
         HEAD_SHA="${{ github.event.pull_request.head.sha }}"
 
-        git fetch --no-tags --depth=200 origin "$BASE_SHA" "$HEAD_SHA"
-        git diff --no-ext-diff --unified=80 "$BASE_SHA...$HEAD_SHA" > raw.patch
-        git diff --name-only "$BASE_SHA...$HEAD_SHA" > changed_files.txt
-        git diff --name-status "$BASE_SHA...$HEAD_SHA" > changed_files_status.txt
-        git diff --stat "$BASE_SHA...$HEAD_SHA" > diff_stat.txt
+        git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA"
+
+        git diff --name-only "$BASE_SHA...$HEAD_SHA" > changed-files.txt
+        git diff --numstat "$BASE_SHA...$HEAD_SHA" > numstat.txt
+        git diff "$BASE_SHA...$HEAD_SHA" > raw.patch
 
         if [ ! -s raw.patch ]; then
           echo "skip=true" >> "$GITHUB_OUTPUT"
-          echo "verdict=SKIPPED" >> "$GITHUB_OUTPUT"
-          echo "reason=No diff to review" >> "$GITHUB_OUTPUT"
+          echo "reason=no_changes" >> "$GITHUB_OUTPUT"
           exit 0
         fi
 
@@ -121,231 +76,241 @@ runs:
         TOTAL=$((ADDITIONS + DELETIONS))
         MAX_LINES=${{ inputs.max_changed_lines }}
         MAX_FILES=${{ inputs.max_changed_files }}
-        MAX_DIFF_BYTES=${{ inputs.max_diff_bytes }}
-        DIFF_BYTES=$(wc -c < raw.patch | tr -d ' ')
 
-        {
-          echo "additions=$ADDITIONS"
-          echo "deletions=$DELETIONS"
-          echo "total_changed_lines=$TOTAL"
-          echo "changed_files=$FILES"
-          echo "diff_bytes=$DIFF_BYTES"
-        } >> "$GITHUB_OUTPUT"
+        echo "changed_lines=$TOTAL" >> "$GITHUB_OUTPUT"
+        echo "changed_files=$FILES" >> "$GITHUB_OUTPUT"
 
-        oversized_reason=""
-        if [ "$TOTAL" -gt "$MAX_LINES" ]; then
-          oversized_reason="${oversized_reason}changed lines ${TOTAL} > ${MAX_LINES}; "
-        fi
-        if [ "$FILES" -gt "$MAX_FILES" ]; then
-          oversized_reason="${oversized_reason}changed files ${FILES} > ${MAX_FILES}; "
-        fi
-        if [ "$DIFF_BYTES" -gt "$MAX_DIFF_BYTES" ]; then
-          oversized_reason="${oversized_reason}diff bytes ${DIFF_BYTES} > ${MAX_DIFF_BYTES}; "
-        fi
-
-        if [ -n "$oversized_reason" ]; then
-          echo "skip=true" >> "$GITHUB_OUTPUT"
-          echo "verdict=BLOCKED" >> "$GITHUB_OUTPUT"
-          echo "reason=$oversized_reason" >> "$GITHUB_OUTPUT"
-          {
-            echo "## 🛡️ AI Automated Audit"
-            echo
-            echo "🚨 **Blocked: PR is too large for reliable AI review.**"
-            echo
-            echo "Reason: $oversized_reason"
-            echo
-            echo "Split this PR into smaller focused changes or raise the review limits intentionally."
-          } > review.md
-
-          if [ "${{ inputs.fail_on_oversized_pr }}" = "true" ]; then
-            echo "oversized_fail=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "oversized_fail=false" >> "$GITHUB_OUTPUT"
-          fi
+        if [ "$TOTAL" -gt "$MAX_LINES" ] || [ "$FILES" -gt "$MAX_FILES" ]; then
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "oversized=true" >> "$GITHUB_OUTPUT"
+          jq -n \
+            --arg details "This PR changes ${TOTAL} lines across ${FILES} files. Limits are ${MAX_LINES} lines and ${MAX_FILES} files. Split this into smaller PRs so security, performance, and correctness can be reviewed reliably." \
+            '{
+              verdict: "BLOCKED",
+              summary: "PR is too large for reliable automated AI review.",
+              issues: [
+                {
+                  severity: "blocking",
+                  category: "reviewability",
+                  file: null,
+                  line: null,
+                  title: "PR exceeds review size limits",
+                  details: $details,
+                  recommendation: "Split the PR into smaller logical changes."
+                }
+              ],
+              reviewers: []
+            }' > review.json
           exit 0
         fi
 
         echo "skip=false" >> "$GITHUB_OUTPUT"
+        echo "oversized=false" >> "$GITHUB_OUTPUT"
 
-    - name: Build Strict Review Prompt
-      id: prompt
+        mkdir -p reviewer-patches reviewer-results
+
+        : > reviewer-patches/security.files
+        : > reviewer-patches/performance.files
+        : > reviewer-patches/typescript.files
+        : > reviewer-patches/react.files
+        : > reviewer-patches/database.files
+        : > reviewer-patches/config.files
+        : > reviewer-patches/docs.files
+
+        while IFS= read -r file; do
+          case "$file" in
+            *.ts|*.tsx|*.js|*.jsx|*.mts|*.cts) echo "$file" >> reviewer-patches/typescript.files ;;
+          esac
+          case "$file" in
+            *.tsx|*.jsx|*/components/*|*/hooks/*|apps/web/*|*.css|*.scss|tailwind.config.*|vite.config.*) echo "$file" >> reviewer-patches/react.files ;;
+          esac
+          case "$file" in
+            apps/api/*|*auth*|*session*|*stripe*|*billing*|*payment*|*secret*|*token*|*permission*|*rbac*|*middleware*|*.sql|*schema*|*migration*|wrangler.toml) echo "$file" >> reviewer-patches/security.files ;;
+          esac
+          case "$file" in
+            apps/api/*|packages/database/*|*query*|*repo*|*repository*|*cache*|*worker*|*queue*|*.sql|*migration*) echo "$file" >> reviewer-patches/performance.files ;;
+          esac
+          case "$file" in
+            *.sql|*migration*|packages/database/*|*drizzle*|*schema*) echo "$file" >> reviewer-patches/database.files ;;
+          esac
+          case "$file" in
+            package.json|pnpm-lock.yaml|package-lock.json|yarn.lock|bun.lockb|*.yml|*.yaml|Dockerfile|wrangler.toml|tsconfig*.json|vite.config.*|eslint.config.*|.github/workflows/*) echo "$file" >> reviewer-patches/config.files ;;
+          esac
+          case "$file" in
+            *.md|docs/*|plans/*) echo "$file" >> reviewer-patches/docs.files ;;
+          esac
+        done < changed-files.txt
+
+        make_patch() {
+          local reviewer="$1"
+          local files_file="reviewer-patches/${reviewer}.files"
+          local patch_file="reviewer-patches/${reviewer}.patch"
+          : > "$patch_file"
+          if [ ! -s "$files_file" ]; then
+            return 0
+          fi
+          sort -u "$files_file" > "${files_file}.uniq"
+          while IFS= read -r f; do
+            git diff "$BASE_SHA...$HEAD_SHA" -- "$f" >> "$patch_file" || true
+          done < "${files_file}.uniq"
+        }
+
+        for reviewer in security performance typescript react database config docs; do
+          make_patch "$reviewer"
+        done
+
+        {
+          echo "Changed files:"
+          cat changed-files.txt
+          echo
+          echo "Numstat:"
+          cat numstat.txt
+          echo
+          echo "Patch:"
+          cat raw.patch
+        } > reviewer-patches/universal.patch
+
+    - name: AI targeted review
+      id: ai
       if: steps.diff.outputs.skip != 'true'
       shell: bash
       env:
         TECH_STACK: ${{ inputs.tech_stack }}
-        INCLUDE_AGENTS_MD: ${{ inputs.include_agents_md }}
-        INCLUDE_PACKAGE_CONTEXT: ${{ inputs.include_package_context }}
-      run: |
-        set -euo pipefail
-
-        PROMPT_FILE=$(mktemp)
-        echo "prompt_file=$PROMPT_FILE" >> "$GITHUB_OUTPUT"
-
-        {
-          printf '%s\n' 'You are a senior staff-level pull request reviewer, similar in strictness to Gemini Code Assist, focused on production-grade code quality.'
-          printf '\n'
-          printf '%s\n' 'You are reviewing ONLY the provided PR diff plus limited repository context. Do not invent files or behavior that are not visible in the diff/context. Be strict, but avoid noisy nitpicks.'
-          printf '\n'
-          printf '%s\n' 'Primary objective:'
-          printf '%s\n' 'Find issues that could block or degrade production readiness, including correctness, security, performance, reliability, maintainability, testability, and architecture.'
-          printf '\n'
-          printf '%s\n' 'Severity policy:'
-          printf '%s\n' '- BLOCKING: Must be fixed before merge. Includes security vulnerabilities, auth/authorization bugs, data loss/corruption, runtime crashes, broken invariants, failing type/build/lint assumptions, unsafe secrets/logging, injection, race conditions, serious performance regressions, missing validation on trust boundaries, or changes that violate AGENTS.md rules.'
-          printf '%s\n' '- CAUTION: Should be fixed soon or before merge if low risk. Includes maintainability, complexity, test gaps, edge cases, moderate performance risks, unclear API boundaries, duplication, or fragile abstractions.'
-          printf '%s\n' '- INFO: Non-blocking observations only. Avoid style-only comments.'
-          printf '\n'
-          printf '%s\n' 'Security checklist:'
-          printf '%s\n' '- Injection risks: SQL/NoSQL/command/template/XSS/SSRF/path traversal'
-          printf '%s\n' '- Broken auth/session/authorization/access-control logic'
-          printf '%s\n' '- Secrets exposure in code, logs, errors, telemetry, client bundles, or diffs'
-          printf '%s\n' '- Unsafe CORS, cookies, CSRF, redirects, file uploads, deserialization'
-          printf '%s\n' '- Missing validation/sanitization at API boundaries'
-          printf '%s\n' '- Dependency or supply-chain risk visible in the diff'
-          printf '\n'
-          printf '%s\n' 'Performance checklist:'
-          printf '%s\n' '- N+1 queries, unnecessary network calls, missing indexes, excessive DB roundtrips'
-          printf '%s\n' '- Blocking I/O or sequential await patterns that should be parallelized'
-          printf '%s\n' '- Expensive render loops, avoidable React rerenders, unstable dependencies'
-          printf '%s\n' '- Memory leaks, unbounded caches, large payloads, inefficient algorithms'
-          printf '%s\n' '- Cloudflare Worker limits, cold start, CPU time, D1/query inefficiency when relevant'
-          printf '\n'
-          printf '%s\n' 'TypeScript/React checklist:'
-          printf '%s\n' '- Preserve strict type safety. Avoid `any`, unsafe casts, non-null assertions, weak generics, leaky types'
-          printf '%s\n' '- Validate runtime data with schemas where appropriate'
-          printf '%s\n' '- Correct React hook usage, dependency arrays, state ownership, controlled/uncontrolled inputs'
-          printf '%s\n' '- Accessibility regressions for UI changes'
-          printf '%s\n' '- Server/client boundary mistakes'
-          printf '\n'
-          printf '%s\n' 'Testing checklist:'
-          printf '%s\n' '- If behavior changed, identify missing or weak tests'
-          printf '%s\n' '- Verify invariants and regression-sensitive paths'
-          printf '%s\n' '- Do not request tests for obvious docs-only changes'
-          printf '\n'
-          printf '%s\n' 'Review style:'
-          printf '%s\n' '- Be direct and actionable.'
-          printf '%s\n' '- Reference files/functions when possible.'
-          printf '%s\n' '- Include suggested fixes, not just complaints.'
-          printf '%s\n' '- Do not comment on formatting, indentation, semicolons, or purely subjective style.'
-          printf '%s\n' '- Do not repeat the same issue multiple times.'
-          printf '%s\n' '- If there are no material issues, return SAFE.'
-          printf '\n'
-          printf '%s\n' 'Required output:'
-          printf '%s\n' 'Return ONLY valid JSON. Do not wrap in markdown. No prose outside JSON.'
-          printf '\n'
-          printf '%s\n' 'Schema:'
-          printf '%s\n' '{'
-          printf '%s\n' '  "verdict": "SAFE" | "CAUTION" | "BLOCKED",'
-          printf '%s\n' '  "summary": "one short paragraph",'
-          printf '%s\n' '  "blocking": ['
-          printf '%s\n' '    {'
-          printf '%s\n' '      "title": "short issue title",'
-          printf '%s\n' '      "file": "path or unknown",'
-          printf '%s\n' '      "risk": "why this matters",'
-          printf '%s\n' '      "suggested_fix": "specific fix"'
-          printf '%s\n' '    }'
-          printf '%s\n' '  ],'
-          printf '%s\n' '  "caution": ['
-          printf '%s\n' '    {'
-          printf '%s\n' '      "title": "short issue title",'
-          printf '%s\n' '      "file": "path or unknown",'
-          printf '%s\n' '      "risk": "why this matters",'
-          printf '%s\n' '      "suggested_fix": "specific fix"'
-          printf '%s\n' '    }'
-          printf '%s\n' '  ],'
-          printf '%s\n' '  "info": ['
-          printf '%s\n' '    {'
-          printf '%s\n' '      "title": "short note",'
-          printf '%s\n' '      "file": "path or unknown",'
-          printf '%s\n' '      "note": "short note"'
-          printf '%s\n' '    }'
-          printf '%s\n' '  ],'
-          printf '%s\n' '  "positive_notes": ["short positive observation, optional"],'
-          printf '%s\n' '  "recommended_tests": ["specific test recommendation, optional"]'
-          printf '%s\n' '}'
-          printf '\n'
-          printf '%s\n' 'Rules:'
-          printf '%s\n' '- verdict MUST be BLOCKED if blocking has one or more items.'
-          printf '%s\n' '- verdict MUST be CAUTION if blocking is empty and caution has one or more items.'
-          printf '%s\n' '- verdict MUST be SAFE only if blocking and caution are empty.'
-        } > "$PROMPT_FILE"
-
-        {
-          echo
-          echo "Repository context:"
-          echo "Tech stack hint: ${TECH_STACK:-auto-detect from diff}"
-          echo
-          echo "Changed files:"
-          sed 's/^/- /' changed_files.txt
-          echo
-          echo "Diff stat:"
-          cat diff_stat.txt
-        } >> "$PROMPT_FILE"
-
-        if [ "$INCLUDE_AGENTS_MD" = "true" ] && [ -f AGENTS.md ]; then
-          {
-            echo
-            echo "AGENTS.md repository instructions:"
-            echo '```md'
-            head -c 20000 AGENTS.md
-            echo
-            echo '```'
-          } >> "$PROMPT_FILE"
-        fi
-
-        if [ "$INCLUDE_PACKAGE_CONTEXT" = "true" ] && [ -f package.json ]; then
-          {
-            echo
-            echo "Root package.json context:"
-            echo '```json'
-            jq '{scripts, dependencies, devDependencies, packageManager, workspaces}' package.json 2>/dev/null || cat package.json
-            echo
-            echo '```'
-          } >> "$PROMPT_FILE"
-        fi
-
-        {
-          echo
-          echo "PR diff:"
-          echo '```diff'
-          cat raw.patch
-          echo
-          echo '```'
-        } >> "$PROMPT_FILE"
-
-    - name: AI Review with Gemini + DeepSeek Fallback
-      id: review
-      if: steps.diff.outputs.skip != 'true'
-      shell: bash
-      env:
-        PROMPT_FILE: ${{ steps.prompt.outputs.prompt_file }}
         PRIMARY_MODEL: ${{ inputs.model }}
         FALLBACK_GEMINI_MODEL: ${{ inputs.fallback_gemini_model }}
         DEEPSEEK_MODEL: ${{ inputs.deepseek_model }}
         GEMINI_KEY: ${{ inputs.gemini_api_key }}
         DEEPSEEK_KEY: ${{ inputs.deepseek_api_key }}
+        MAX_PATCH_BYTES: ${{ inputs.max_patch_bytes_per_reviewer }}
       run: |
         set -euo pipefail
 
+        if [ "${{ steps.diff.outputs.oversized }}" = "true" ]; then
+          cp review.json reviewer-results/final.json
+          exit 0
+        fi
+
+        mkdir -p reviewer-results prompts
+
+        REPO_CONTEXT=$(mktemp)
+        {
+          echo "Repository context:"
+          echo "- PR: #${{ github.event.pull_request.number }}"
+          echo "- Base: ${{ github.event.pull_request.base.ref }} (${{ github.event.pull_request.base.sha }})"
+          echo "- Head: ${{ github.event.pull_request.head.ref }} (${{ github.event.pull_request.head.sha }})"
+          if [ -n "$TECH_STACK" ]; then
+            echo "- Tech stack: $TECH_STACK"
+          else
+            echo "- Tech stack: infer from changed files and manifests"
+          fi
+          if [ -f package.json ]; then
+            echo "- package.json scripts:"
+            jq -c '.scripts // {}' package.json 2>/dev/null || true
+          fi
+          if [ -f AGENTS.md ]; then
+            echo "- AGENTS.md key rules summary available in repo. Obey repository rules when visible from diff/context."
+          fi
+        } > "$REPO_CONTEXT"
+
+        trim_patch() {
+          local input="$1"
+          local output="$2"
+          local size
+          size=$(wc -c < "$input" 2>/dev/null || echo 0)
+          if [ "$size" -gt "$MAX_PATCH_BYTES" ]; then
+            head -c "$MAX_PATCH_BYTES" "$input" > "$output"
+            printf '\n\n--- PATCH TRUNCATED FOR THIS REVIEWER: original %s bytes, sent %s bytes. If important files are omitted, verdict must be CAUTION or BLOCKED. ---\n' "$size" "$MAX_PATCH_BYTES" >> "$output"
+          else
+            cp "$input" "$output"
+          fi
+        }
+
+        build_prompt() {
+          local reviewer="$1"
+          local patch_file="$2"
+          local prompt_file="$3"
+
+          cat "$REPO_CONTEXT" > "$prompt_file"
+          {
+            printf '%s\n' ''
+            printf '%s\n' 'You are an expert pull request reviewer. Review ONLY the supplied diff/context. Do not invent files or facts not present.'
+            printf '%s\n' ''
+            printf '%s\n' 'Return STRICT JSON only. No markdown fences. No prose outside JSON.'
+            printf '%s\n' ''
+            printf '%s\n' 'Schema:'
+            printf '%s\n' '{'
+            printf '%s\n' '  "reviewer": "string",'
+            printf '%s\n' '  "verdict": "SAFE" | "CAUTION" | "BLOCKED",'
+            printf '%s\n' '  "summary": "one concise sentence",'
+            printf '%s\n' '  "issues": ['
+            printf '%s\n' '    {'
+            printf '%s\n' '      "severity": "blocking" | "warning" | "suggestion",'
+            printf '%s\n' '      "category": "security" | "performance" | "correctness" | "typescript" | "react" | "database" | "config" | "testing" | "maintainability" | "docs",'
+            printf '%s\n' '      "file": "path or null",'
+            printf '%s\n' '      "line": "line number or null",'
+            printf '%s\n' '      "title": "short issue title",'
+            printf '%s\n' '      "details": "specific explanation tied to the diff",'
+            printf '%s\n' '      "recommendation": "specific fix"'
+            printf '%s\n' '    }'
+            printf '%s\n' '  ]'
+            printf '%s\n' '}'
+            printf '%s\n' ''
+            printf '%s\n' 'Verdict rules:'
+            printf '%s\n' '- BLOCKED when there is any security vulnerability, correctness bug, data loss risk, auth/access-control flaw, production-breaking issue, failing invariant, unsafe migration, or high-confidence serious performance regression.'
+            printf '%s\n' '- CAUTION when the PR is probably mergeable but has meaningful warnings, incomplete tests, unclear edge cases, or truncated review context.'
+            printf '%s\n' '- SAFE only when no blocking or meaningful warning exists.'
+            printf '%s\n' '- Do not comment on formatting, style preferences, indentation, or missing semicolons unless they cause real risk.'
+            printf '%s\n' '- Keep output concise. Maximum 8 issues.'
+          } >> "$prompt_file"
+
+          case "$reviewer" in
+            universal)
+              printf '%s\n' '' 'Reviewer focus: broad correctness, regression risk, changed-file impact, unsafe behavior, missing obvious tests. Avoid duplicating highly specialized framework comments unless they are serious.' >> "$prompt_file"
+              ;;
+            security)
+              printf '%s\n' '' 'Reviewer focus: security only. Check OWASP risks, auth/session mistakes, access control, secrets, injection, SSRF, XSS, CSRF, insecure redirects, webhook validation, payment/billing trust boundaries, production fail-open behavior, logging sensitive data, and dependency/config risks.' >> "$prompt_file"
+              ;;
+            performance)
+              printf '%s\n' '' 'Reviewer focus: performance and scalability only. Check N+1 queries, missing indexes, excessive network calls, blocking I/O, memory leaks, expensive render loops, inefficient algorithms, cache misuse, Cloudflare Worker CPU/bundle risks, and avoid premature micro-optimization comments.' >> "$prompt_file"
+              ;;
+            typescript)
+              printf '%s\n' '' 'Reviewer focus: TypeScript quality, API contracts, type safety, maintainability, architecture, error handling, strictness, unnecessary any/unknown misuse, unsafe casts, broken discriminated unions, runtime validation gaps, and testability.' >> "$prompt_file"
+              ;;
+            react)
+              printf '%s\n' '' 'Reviewer focus: React/Vite/frontend only. Check hooks rules, dependency arrays, render loops, stale closures, accessibility, state management, Suspense/loading/error states, client/server boundary assumptions, hydration risks, performance, and user-facing regressions.' >> "$prompt_file"
+              ;;
+            database)
+              printf '%s\n' '' 'Reviewer focus: database and migrations only. Check unsafe migrations, data loss, broken Drizzle schema changes, bad timestamp types, missing constraints/indexes, query correctness, seed/migration ordering, local D1 compatibility, and rollback risks.' >> "$prompt_file"
+              ;;
+            config)
+              printf '%s\n' '' 'Reviewer focus: config, CI, dependencies, package scripts, Wrangler, TypeScript/ESLint/Vite configs. Check supply-chain risk, broken scripts, insecure environment handling, production-vs-local confusion, and CI bypasses.' >> "$prompt_file"
+              ;;
+            docs)
+              printf '%s\n' '' 'Reviewer focus: documentation accuracy only. Check whether docs contradict code or repository rules. Do not block on wording preferences.' >> "$prompt_file"
+              ;;
+          esac
+
+          printf '\nDiff/context for this reviewer:\n```diff\n' >> "$prompt_file"
+          cat "$patch_file" >> "$prompt_file"
+          printf '\n```\n' >> "$prompt_file"
+        }
+
         call_gemini() {
           local model="$1"
-          local out_file="$2"
-          local status_file="$3"
+          local prompt_file="$2"
+          local out_file="$3"
+          local status_file="$4"
           local json_file response_file http_code error_summary
-
           json_file=$(mktemp)
           response_file=$(mktemp)
 
-          jq -n --rawfile c "$PROMPT_FILE" '{
-            contents: [{parts: [{text: $c}]}],
-            generationConfig: {
-              temperature: 0.05,
-              topP: 0.9,
-              responseMimeType: "application/json"
-            }
+          jq -n --rawfile c "$prompt_file" '{
+            contents:[{parts:[{text:$c}]}],
+            generationConfig:{temperature:0.05, responseMimeType:"application/json"}
           }' > "$json_file"
 
           http_code=$(curl -sS -w "%{http_code}" -o "$response_file" \
-            --retry 3 --retry-delay 2 --retry-all-errors \
+            --retry 2 --retry-delay 2 \
             -H "x-goog-api-key: $GEMINI_KEY" \
             -H "Content-Type: application/json" \
             -d @"$json_file" \
@@ -353,11 +318,6 @@ runs:
 
           if [ "$http_code" -eq 200 ]; then
             jq -r '.candidates[0].content.parts[0].text // empty' "$response_file" > "$out_file"
-            if [ ! -s "$out_file" ]; then
-              echo "EMPTY_RESPONSE" > "$status_file"
-              rm -f "$json_file" "$response_file"
-              return 1
-            fi
             echo "SUCCESS" > "$status_file"
             rm -f "$json_file" "$response_file"
             return 0
@@ -365,43 +325,36 @@ runs:
 
           error_summary=$(jq -c '{error: (.error.message // .error.status // .error.code // "unknown")}' "$response_file" 2>/dev/null || true)
           [ -n "$error_summary" ] || error_summary=$(tr '\n' ' ' < "$response_file" | cut -c1-400)
-
-          case "$http_code" in
-            429) echo "RATE_LIMIT" > "$status_file" ;;
-            500|502|503|504) echo "SERVICE_UNAVAILABLE" > "$status_file" ;;
-            *) echo "ERROR_$http_code" > "$status_file" ;;
-          esac
-
-          echo "Gemini request failed model=$model http_code=$http_code status=$(cat "$status_file") response=$error_summary"
+          if [ "$http_code" -eq 429 ]; then
+            echo "RATE_LIMIT" > "$status_file"
+          elif [ "$http_code" -eq 500 ] || [ "$http_code" -eq 503 ]; then
+            echo "SERVICE_UNAVAILABLE" > "$status_file"
+          else
+            echo "ERROR_$http_code" > "$status_file"
+          fi
+          echo "Gemini failed model=$model http=$http_code response=$error_summary"
           rm -f "$json_file" "$response_file"
           return 1
         }
 
         call_deepseek() {
           local model="$1"
-          local out_file="$2"
+          local prompt_file="$2"
+          local out_file="$3"
           local json_file response_file http_code error_summary
-
-          if [ -z "$DEEPSEEK_KEY" ]; then
-            echo "DeepSeek key not configured."
-            return 1
-          fi
-
           json_file=$(mktemp)
           response_file=$(mktemp)
 
-          jq -n --arg m "$model" --rawfile c "$PROMPT_FILE" '{
+          jq -n --arg m "$model" --rawfile c "$prompt_file" '{
             model: $m,
-            messages: [
-              {role: "system", content: "Return only valid JSON matching the requested schema."},
-              {role: "user", content: $c}
-            ],
+            messages: [{role:"user", content:$c}],
             temperature: 0.05,
-            stream: false
+            stream: false,
+            response_format: {type: "json_object"}
           }' > "$json_file"
 
           http_code=$(curl -sS -w "%{http_code}" -o "$response_file" \
-            --retry 3 --retry-delay 2 --retry-all-errors \
+            --retry 2 --retry-delay 2 \
             -H "Authorization: Bearer $DEEPSEEK_KEY" \
             -H "Content-Type: application/json" \
             -d @"$json_file" \
@@ -409,242 +362,180 @@ runs:
 
           if [ "$http_code" -eq 200 ]; then
             jq -r '.choices[0].message.content // empty' "$response_file" > "$out_file"
-            if [ ! -s "$out_file" ]; then
-              rm -f "$json_file" "$response_file"
-              return 1
-            fi
             rm -f "$json_file" "$response_file"
             return 0
           fi
 
           error_summary=$(jq -c '{error: (.error.message // .error.type // .error.code // "unknown")}' "$response_file" 2>/dev/null || true)
           [ -n "$error_summary" ] || error_summary=$(tr '\n' ' ' < "$response_file" | cut -c1-400)
-          echo "DeepSeek request failed model=$model http_code=$http_code response=$error_summary"
+          echo "DeepSeek failed model=$model http=$http_code response=$error_summary"
           rm -f "$json_file" "$response_file"
           return 1
         }
 
-        STATUS_SIGNAL=$(mktemp)
-        OUT_PAYLOAD=$(mktemp)
-        RC=1
-
-        echo "Attempting primary Gemini model: $PRIMARY_MODEL"
-        call_gemini "$PRIMARY_MODEL" "$OUT_PAYLOAD" "$STATUS_SIGNAL" && RC=0 || RC=$?
-
-        if [ "$RC" -ne 0 ]; then
-          SIGNAL=$(cat "$STATUS_SIGNAL" 2>/dev/null || echo UNKNOWN)
-          if [ "$SIGNAL" = "RATE_LIMIT" ]; then
-            sleep 5
-          fi
-
-          echo "Attempting fallback Gemini model: $FALLBACK_GEMINI_MODEL"
-          call_gemini "$FALLBACK_GEMINI_MODEL" "$OUT_PAYLOAD" "$STATUS_SIGNAL" && RC=0 || RC=$?
-        fi
-
-        if [ "$RC" -ne 0 ] && [ -n "$DEEPSEEK_KEY" ]; then
-          echo "Attempting DeepSeek fallback model: $DEEPSEEK_MODEL"
-          call_deepseek "$DEEPSEEK_MODEL" "$OUT_PAYLOAD" && RC=0 || RC=$?
-        fi
-
-        if [ "$RC" -eq 0 ]; then
-          perl -0777 -pe 's/^```(?:json)?\s*//; s/\s*```$//' "$OUT_PAYLOAD" > review.json
-          echo "ok=true" >> "$GITHUB_OUTPUT"
-        else
-          jq -n '{
-            verdict: "ERROR",
-            summary: "All AI review providers failed or were throttled. Manual review is required.",
-            blocking: [
-              {
-                title: "AI review unavailable",
-                file: "unknown",
-                risk: "The automated strict review did not complete, so this PR has not passed the required AI quality gate.",
-                suggested_fix: "Retry the workflow or perform and document a manual senior review."
-              }
-            ],
-            caution: [],
-            info: [],
-            positive_notes: [],
-            recommended_tests: []
-          }' > review.json
-          echo "ok=false" >> "$GITHUB_OUTPUT"
-        fi
-
-        rm -f "$STATUS_SIGNAL" "$OUT_PAYLOAD"
-
-    - name: Parse Review Verdict
-      id: parse
-      if: steps.diff.outputs.skip != 'true'
-      shell: bash
-      env:
-        REQUIRE_VALID_JSON: ${{ inputs.require_valid_json }}
-      run: |
-        set -euo pipefail
-
-        if ! jq empty review.json >/dev/null 2>&1; then
-          echo "Model did not return valid JSON."
-          if [ "$REQUIRE_VALID_JSON" = "true" ]; then
-            jq -n '{
-              verdict: "BLOCKED",
-              summary: "AI review response was not valid JSON, so the strict review gate cannot be trusted.",
-              blocking: [
-                {
-                  title: "Invalid AI review output",
-                  file: "unknown",
-                  risk: "The review output could not be parsed, so required issues may have been missed.",
-                  suggested_fix: "Retry the workflow. If repeated, inspect the raw model output and adjust prompt/model limits."
-                }
-              ],
-              caution: [],
-              info: [],
-              positive_notes: [],
-              recommended_tests: []
-            }' > review.json
+        normalize_json() {
+          local raw="$1"
+          local out="$2"
+          if jq -e . "$raw" >/dev/null 2>&1; then
+            jq . "$raw" > "$out"
           else
-            jq -n '{
-              verdict: "CAUTION",
-              summary: "AI review returned invalid JSON.",
-              blocking: [],
-              caution: [
-                {
-                  title: "Invalid AI review output",
-                  file: "unknown",
-                  risk: "Review could not be parsed reliably.",
-                  suggested_fix: "Retry workflow or review manually."
-                }
-              ],
-              info: [],
-              positive_notes: [],
-              recommended_tests: []
-            }' > review.json
+            python3 -c 'import json, re, sys; text=open(sys.argv[1], encoding="utf-8").read(); match=re.search(r"\{.*\}", text, re.S); assert match; obj=json.loads(match.group(0)); json.dump(obj, open(sys.argv[2], "w", encoding="utf-8"), indent=2)' "$raw" "$out"
           fi
-        fi
+        }
 
-        verdict=$(jq -r '.verdict // "BLOCKED"' review.json)
-        blocking_count=$(jq '.blocking | length' review.json)
-        caution_count=$(jq '.caution | length' review.json)
+        review_one() {
+          local reviewer="$1"
+          local source_patch="reviewer-patches/${reviewer}.patch"
+          local trimmed="reviewer-patches/${reviewer}.trimmed.patch"
+          local prompt="prompts/${reviewer}.prompt.txt"
+          local raw_out="reviewer-results/${reviewer}.raw.json"
+          local json_out="reviewer-results/${reviewer}.json"
+          local status_file rc signal
+          status_file=$(mktemp)
 
-        if [ "$blocking_count" -gt 0 ]; then
-          verdict="BLOCKED"
-        elif [ "$caution_count" -gt 0 ] && [ "$verdict" = "SAFE" ]; then
-          verdict="CAUTION"
-        fi
+          if [ ! -s "$source_patch" ]; then
+            jq -n --arg reviewer "$reviewer" '{
+              reviewer: $reviewer,
+              verdict: "SAFE",
+              summary: "No relevant changed files for this reviewer.",
+              issues: []
+            }' > "$json_out"
+            return 0
+          fi
 
-        echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
-        echo "blocking_count=$blocking_count" >> "$GITHUB_OUTPUT"
-        echo "caution_count=$caution_count" >> "$GITHUB_OUTPUT"
+          trim_patch "$source_patch" "$trimmed"
+          build_prompt "$reviewer" "$trimmed" "$prompt"
 
-    - name: Render Review Comment
+          echo "Running $reviewer review with $PRIMARY_MODEL"
+          call_gemini "$PRIMARY_MODEL" "$prompt" "$raw_out" "$status_file" && rc=0 || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            signal=$(cat "$status_file" || true)
+            if [ "$signal" = "RATE_LIMIT" ]; then sleep 5; fi
+            echo "Running $reviewer fallback with $FALLBACK_GEMINI_MODEL"
+            call_gemini "$FALLBACK_GEMINI_MODEL" "$prompt" "$raw_out" "$status_file" && rc=0 || rc=$?
+          fi
+          if [ "$rc" -ne 0 ] && [ -n "$DEEPSEEK_KEY" ]; then
+            echo "Running $reviewer fallback with $DEEPSEEK_MODEL"
+            call_deepseek "$DEEPSEEK_MODEL" "$prompt" "$raw_out" && rc=0 || rc=$?
+          fi
+
+          if [ "$rc" -ne 0 ]; then
+            jq -n --arg reviewer "$reviewer" '{
+              reviewer: $reviewer,
+              verdict: "CAUTION",
+              summary: "AI reviewer failed or was throttled. Human review required for this category.",
+              issues: [
+                {
+                  severity: "warning",
+                  category: "maintainability",
+                  file: null,
+                  line: null,
+                  title: "AI reviewer unavailable",
+                  details: ("The " + $reviewer + " reviewer could not complete using configured providers."),
+                  recommendation: "Perform manual review for this category before merging."
+                }
+              ]
+            }' > "$json_out"
+          else
+            if ! normalize_json "$raw_out" "$json_out"; then
+              jq -n --arg reviewer "$reviewer" '{
+                reviewer: $reviewer,
+                verdict: "CAUTION",
+                summary: "AI reviewer returned invalid JSON. Human review required.",
+                issues: [
+                  {
+                    severity: "warning",
+                    category: "maintainability",
+                    file: null,
+                    line: null,
+                    title: "Invalid AI review output",
+                    details: ("The " + $reviewer + " reviewer returned output that could not be parsed as JSON."),
+                    recommendation: "Inspect raw output in action logs and perform manual review."
+                  }
+                ]
+              }' > "$json_out"
+            fi
+          fi
+          rm -f "$status_file"
+        }
+
+        for reviewer in universal security performance typescript react database config docs; do
+          review_one "$reviewer"
+        done
+
+        jq -s '{
+          reviewers: .,
+          verdict: (
+            if any(.[]; .verdict == "BLOCKED" or any(.issues[]?; .severity == "blocking")) then "BLOCKED"
+            elif any(.[]; .verdict == "CAUTION" or any(.issues[]?; .severity == "warning")) then "CAUTION"
+            else "SAFE"
+            end
+          ),
+          summary: "Token-optimized targeted AI PR review completed.",
+          issues: [.[].issues[]?]
+        }' reviewer-results/*.json > reviewer-results/final.json
+
+        cp reviewer-results/final.json review.json
+        rm -f "$REPO_CONTEXT"
+
+    - name: Render PR review comment
       if: steps.diff.outputs.skip != 'true'
       shell: bash
       run: |
         set -euo pipefail
 
         verdict=$(jq -r '.verdict' review.json)
-        summary=$(jq -r '.summary // "No summary provided."' review.json)
-        blocking_count=$(jq '.blocking | length' review.json)
-        caution_count=$(jq '.caution | length' review.json)
-        info_count=$(jq '.info | length' review.json)
+        issue_count=$(jq '.issues | length' review.json)
+        blocking_count=$(jq '[.issues[]? | select(.severity == "blocking")] | length' review.json)
+        warning_count=$(jq '[.issues[]? | select(.severity == "warning")] | length' review.json)
 
         {
-          echo "## 🛡️ Strict AI Code Review"
+          echo "## 🛡️ AI Automated PR Review"
           echo
           echo "**Verdict:** $verdict"
-          echo "**Blocking:** $blocking_count | **Caution:** $caution_count | **Info:** $info_count"
           echo
-          echo "$summary"
+          echo "**Issues:** $issue_count total · $blocking_count blocking · $warning_count warning"
           echo
-
-          if [ "$blocking_count" -gt 0 ]; then
-            echo "### 🚨 Blocking Issues"
-            jq -r '.blocking[] | "#### " + .title + "\n- **File:** " + (.file // "unknown") + "\n- **Risk:** " + (.risk // "") + "\n- **Suggested fix:** " + (.suggested_fix // "") + "\n"' review.json
+          echo "### Reviewer Results"
+          jq -r '.reviewers[]? | "- **\(.reviewer)**: \(.verdict) — \(.summary)"' review.json
+          echo
+          if [ "$issue_count" -eq 0 ]; then
+            echo "LGTM! No structural, security, or performance issues identified."
+          else
+            echo "### Findings"
+            jq -r '.issues[]? | "\n#### \(.severity | ascii_upcase): \(.title)\n- **Category:** \(.category)\n- **File:** \(.file // "N/A")\n- **Line:** \(.line // "N/A")\n- **Details:** \(.details)\n- **Recommendation:** \(.recommendation)"' review.json
           fi
-
-          if [ "$caution_count" -gt 0 ]; then
-            echo "### ⚠️ Caution Issues"
-            jq -r '.caution[] | "#### " + .title + "\n- **File:** " + (.file // "unknown") + "\n- **Risk:** " + (.risk // "") + "\n- **Suggested fix:** " + (.suggested_fix // "") + "\n"' review.json
-          fi
-
-          if [ "$info_count" -gt 0 ]; then
-            echo "### ℹ️ Notes"
-            jq -r '.info[] | "- **" + .title + "** (`" + (.file // "unknown") + "`): " + (.note // "")' review.json
-            echo
-          fi
-
-          tests_count=$(jq '.recommended_tests | length' review.json)
-          if [ "$tests_count" -gt 0 ]; then
-            echo "### 🧪 Recommended Tests"
-            jq -r '.recommended_tests[] | "- " + .' review.json
-            echo
-          fi
-
+          echo
           echo "---"
-          echo
-          echo "Review scope: staged PR diff from base to head. Large subjective style-only comments are intentionally excluded."
-        } > review.md
+          echo "Token-optimized review: targeted reviewers only received relevant patches where possible."
+        } > comment.md
 
     - name: Post Review Comment
-      if: steps.diff.outputs.skip != 'true' && inputs.post_review_comment == 'true'
+      if: steps.diff.outputs.skip != 'true' && inputs.post_comment == 'true'
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
         PR: ${{ github.event.pull_request.number }}
       run: |
         set -euo pipefail
-        gh pr comment "$PR" --body-file review.md
+        gh pr comment "$PR" --body-file comment.md
 
-    - name: Post Oversized Review Comment
-      if: steps.diff.outputs.skip == 'true' && inputs.post_review_comment == 'true'
+    - name: Enforce AI review gate
+      if: steps.diff.outputs.skip != 'true'
       shell: bash
-      env:
-        GH_TOKEN: ${{ github.token }}
-        PR: ${{ github.event.pull_request.number }}
       run: |
         set -euo pipefail
-        if [ -f review.md ]; then
-          gh pr comment "$PR" --body-file review.md
+        verdict=$(jq -r '.verdict' review.json)
+        fail_on_caution='${{ inputs.fail_on_caution }}'
+
+        if [ "$verdict" = "BLOCKED" ]; then
+          echo "AI review verdict is BLOCKED. Failing check."
+          exit 1
         fi
 
-    - name: Enforce Strict Review Gate
-      if: always()
-      shell: bash
-      env:
-        FAIL_ON: ${{ inputs.fail_on }}
-      run: |
-        set -euo pipefail
-
-        if [ "${{ steps.diff.outputs.skip }}" = "true" ]; then
-          if [ "${{ steps.diff.outputs.oversized_fail }}" = "true" ]; then
-            echo "Failing because PR is oversized for reliable strict AI review."
-            exit 1
-          fi
-          echo "Review skipped: ${{ steps.diff.outputs.reason }}"
-          exit 0
+        if [ "$fail_on_caution" = "true" ] && [ "$verdict" = "CAUTION" ]; then
+          echo "AI review verdict is CAUTION and fail_on_caution=true. Failing check."
+          exit 1
         fi
 
-        verdict="${{ steps.parse.outputs.verdict }}"
-        blocking_count="${{ steps.parse.outputs.blocking_count }}"
-        caution_count="${{ steps.parse.outputs.caution_count }}"
-
-        case "$FAIL_ON" in
-          blocked)
-            if [ "$verdict" = "BLOCKED" ] || [ "${blocking_count:-0}" -gt 0 ]; then
-              echo "Strict AI review failed: BLOCKED with ${blocking_count} blocking issue(s)."
-              exit 1
-            fi
-            ;;
-          caution)
-            if [ "$verdict" = "BLOCKED" ] || [ "$verdict" = "CAUTION" ] || [ "${blocking_count:-0}" -gt 0 ] || [ "${caution_count:-0}" -gt 0 ]; then
-              echo "Strict AI review failed: verdict=$verdict blocking=${blocking_count} caution=${caution_count}."
-              exit 1
-            fi
-            ;;
-          never)
-            echo "Strict AI review completed but failure enforcement disabled."
-            ;;
-          *)
-            echo "Invalid fail_on value: $FAIL_ON. Use blocked, caution, or never."
-            exit 1
-            ;;
-        esac
-
-        echo "Strict AI review passed: verdict=$verdict."
+        echo "AI review gate passed with verdict: $verdict"
