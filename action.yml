@@ -187,6 +187,7 @@ runs:
           local response_file
           response_file=$(mktemp)
           local http_code
+          local error_summary
           
           http_code=$(curl -sS -w "%{http_code}" -o "$response_file" \
             --retry 2 --retry-delay 2 \
@@ -201,6 +202,14 @@ runs:
             rm -f "$response_file" "$json_file"
             return 0
           else
+            error_summary=$(jq -c '{
+              error: (.error.message // .error.status // .error.code // "unknown"),
+              details: (.error.details // empty)
+            }' "$response_file" 2>/dev/null || true)
+            if [ -z "$error_summary" ]; then
+              error_summary=$(tr '\n' ' ' < "$response_file" | cut -c1-400)
+            fi
+
             if [ "$http_code" -eq 429 ]; then
               echo "RATE_LIMIT" > "$status_file"
             elif [ "$http_code" -eq 503 ] || [ "$http_code" -eq 500 ]; then
@@ -208,6 +217,7 @@ runs:
             else
               echo "ERROR_$http_code" > "$status_file"
             fi
+            echo "Gemini request failed for model=$model http_code=$http_code status=$(cat "$status_file") response=$error_summary"
             rm -f "$response_file" "$json_file"
             return 1
           fi
@@ -232,6 +242,7 @@ runs:
           local response_file
           response_file=$(mktemp)
           local http_code
+          local error_summary
           
           http_code=$(curl -sS -w "%{http_code}" -o "$response_file" \
             --retry 2 --retry-delay 2 \
@@ -245,6 +256,13 @@ runs:
             rm -f "$response_file" "$json_file"
             return 0
           else
+            error_summary=$(jq -c '{
+              error: (.error.message // .error.type // .error.code // "unknown")
+            }' "$response_file" 2>/dev/null || true)
+            if [ -z "$error_summary" ]; then
+              error_summary=$(tr '\n' ' ' < "$response_file" | cut -c1-400)
+            fi
+            echo "DeepSeek request failed for model=$model http_code=$http_code response=$error_summary"
             rm -f "$response_file" "$json_file"
             return 1
           fi
