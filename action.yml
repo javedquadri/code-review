@@ -188,6 +188,8 @@ runs:
           printf '%s\n' '- Review scope: changed textual files only'
           printf '%s\n' "- Patch size: ${PATCH_BYTES} bytes"
           printf '\n'
+          printf '%s\n' 'For each issue, report the line number from the new file (the + side of the diff).'
+          printf '\n'
           printf '%s\n' 'Rules:'
           printf '%s\n' '- Do not complain about formatting, style preferences, indentation, or missing semicolons unless they create real risk.'
           printf '%s\n' '- Do not invent issues outside the diff.'
@@ -216,7 +218,7 @@ runs:
           printf '%s\n' '      "severity": "critical" | "high" | "medium" | "low",'
           printf '%s\n' '      "category": "security" | "correctness" | "performance" | "typescript" | "react" | "testing" | "maintainability",'
           printf '%s\n' '      "file": "path/to/file",'
-          printf '%s\n' '      "line_hint": "changed line or nearby symbol if known",'
+          printf '%s\n' '      "line": 0,'
           printf '%s\n' '      "title": "short issue title",'
           printf '%s\n' '      "why_it_matters": "brief concrete risk",'
           printf '%s\n' '      "suggested_fix": "brief actionable fix"'
@@ -329,7 +331,7 @@ runs:
                 severity: "high",
                 category: "maintainability",
                 file: "workflow",
-                line_hint: "AI review",
+                line: "AI review",
                 title: "Automated review unavailable",
                 why_it_matters: "The configured AI reviewers failed or were throttled, so this PR did not receive the required automated quality/security review.",
                 suggested_fix: "Retry the workflow or require a human reviewer to complete equivalent security, correctness, performance, and code-quality checks."
@@ -349,7 +351,7 @@ runs:
                   severity: "high",
                   category: "maintainability",
                   file: "workflow",
-                  line_hint: "AI review",
+                  line: "AI review",
                   title: "Malformed AI review output",
                   why_it_matters: "The workflow could not parse the automated review verdict safely.",
                   suggested_fix: "Retry the workflow or inspect raw logs and perform human review."
@@ -364,39 +366,43 @@ runs:
 
         rm -f "$STATUS_SIGNAL" "$RAW_REVIEW" "$PROMPT_FILE"
 
-    - name: Post Review Comment
+    - name: Post Inline Review
       if: steps.diff.outputs.skip != 'true' && steps.diff.outputs.oversized != 'true'
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
         PR: ${{ github.event.pull_request.number }}
         PATCH_BYTES: ${{ steps.diff.outputs.patch_bytes }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        REPO: ${{ github.repository }}
       run: |
         set -euo pipefail
 
         VERDICT=$(jq -r '.verdict' review.json)
         SUMMARY=$(jq -r '.summary // "No summary provided."' review.json)
 
-        {
-          echo '## 🛡️ AI Code Review'
-          echo
-          echo "**Verdict:** ${VERDICT}"
-          echo "**Patch reviewed:** ${PATCH_BYTES} bytes"
-          echo
-          echo "${SUMMARY}"
-          echo
+        # Map verdict to GitHub review event
+        case "$VERDICT" in
+          SAFE)    EVENT="APPROVE" ;;
+          CAUTION) EVENT="COMMENT" ;;
+          BLOCKED) EVENT="REQUEST_CHANGES" ;;
+          *)       EVENT="COMMENT" ;;
+        esac
 
-          ISSUE_COUNT=$(jq '.issues | length' review.json)
-          if [ "$ISSUE_COUNT" -eq 0 ]; then
-            echo 'LGTM! No structural, security, correctness, or performance issues identified.'
-          else
-            echo '### Findings'
-            echo
-            jq -r '.issues[] | "- **[" + .severity + "] [" + .category + "] " + .file + " - " + .title + "\n  - Line/symbol: " + (.line_hint // "unknown") + "\n  - Risk: " + .why_it_matters + "\n  - Fix: " + .suggested_fix + "\n"' review.json
-          fi
-        } > comment.md
-
-        gh pr comment "$PR" --body-file comment.md
+        # Build inline comments from review.json issues
+        gh api "repos/$REPO/pulls/$PR/reviews" \
+          --method POST \
+          --input <(jq -n \
+            --arg sha "$HEAD_SHA" \
+            --arg event "$EVENT" \
+            --arg summary "## 🛡️ AI Code Review\n\n**Verdict:** $VERDICT\n**Patch reviewed:** ${PATCH_BYTES} bytes\n\n$SUMMARY" \
+            --argjson issues "$(jq -c '.issues | map({path: .file, line: (.line // 0), side: "RIGHT", body: ("**[\(.severity)] [\(.category)]** \(.title)\n\n**Risk:** \(.why_it_matters)\n\n**Fix:** \(.suggested_fix)")})' review.json)" \
+            '{
+              commit_id: $sha,
+              event: $event,
+              body: $summary,
+              comments: $issues
+            }')
 
     - name: Enforce Review Verdict
       if: steps.diff.outputs.skip != 'true' && steps.diff.outputs.oversized != 'true'
